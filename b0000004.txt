@@ -1,0 +1,998 @@
+"""FastMCP server exposing GitLab wiki, issue, milestone, repository, and merge request operations as MCP tools.
+
+Reads config from the environment (`.env` supported): `GITLAB_URL` and `GITLAB_PAT`
+are required; `MCP_HOST`/`MCP_PORT` default to `0.0.0.0:8000`. On import it constructs
+a shared `GitLabClient` and registers the tools, then serves them over SSE transport
+when run as a script. Each `@mcp.tool()` function's docstring is the description shown
+to MCP clients, so it is a thin async pass-through to the matching `GitLabClient` method.
+
+Tool docstrings and parameter `Field(description=...)` annotations are written to be
+*decision-oriented*: the first line says WHEN to reach for the tool, and read tools
+state that they return live GitLab data (so a model answers by calling, not guessing).
+The cross-project search tools (`search_wiki`, `search_issues`, `list_wiki_index`)
+are backed by `search_cache.SearchCache` over the curated project list in
+`GITLAB_WIKI_PROJECTS_FILE` (default `wiki_projects.toml`); the cache is warmed in
+the background at startup and kept fresh by Events-API deltas.
+"""
+import argparse
+import asyncio
+import contextlib
+import json
+import os
+from pathlib import Path
+from typing import Annotated, Literal
+from dotenv import load_dotenv
+from pydantic import Field
+from mcp.server.fastmcp import FastMCP
+from client import GitLabClient, GitLabError
+from search_cache import SearchCache, load_wiki_projects, log, split_sections, clip
+
+load_dotenv()
+
+_gitlab_url = os.environ.get("GITLAB_URL", "").rstrip("/")
+_gitlab_pat = os.environ.get("GITLAB_PAT", "")
+_host = os.environ.get("MCP_HOST", "0.0.0.0")
+_port = int(os.environ.get("MCP_PORT", "8000"))
+_projects_file = os.environ.get("GITLAB_WIKI_PROJECTS_FILE", "wiki_projects.toml")
+# Snapshot of the search cache, restored on restart (set empty to disable persistence).
+_cache_file = os.environ.get("GITLAB_SEARCH_CACHE_FILE", ".search_cache.json") or None
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Read a boolean env var, treating 1/true/yes/on (any case) as True."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+# Mutating tools (create_*/update_*/add_*_note) are OFF by default: the onboarding
+# deployment is read-only, which also keeps the tool menu small for weaker models.
+# Set GITLAB_MCP_ENABLE_WRITES=1 to expose them.
+_enable_writes = _env_bool("GITLAB_MCP_ENABLE_WRITES", False)
+
+if not _gitlab_url or not _gitlab_pat:
+    raise RuntimeError("GITLAB_URL and GITLAB_PAT must be set (in .env or environment)")
+
+gl = GitLabClient(_gitlab_url, _gitlab_pat)
+cache = SearchCache(gl, load_wiki_projects(_projects_file), cache_file=_cache_file)
+# Let every tool accept a human project *name*, not just an id/path: the client
+# routes each `project` argument through the cache's resolver before calling GitLab.
+gl.project_resolver = cache.resolve_project
+
+
+# ── Reusable parameter annotations ────────────────────────────────────────────
+# Shared so the same identifier is described the same way on every tool the model sees.
+
+Project = Annotated[
+    str,
+    Field(
+        description="Which project to act on: a numeric project ID (e.g. '42'), a "
+        "'namespace/name' path (e.g. 'platform/backend'), OR a human project name "
+        "(e.g. 'Integration of AXTRANS') — names are resolved automatically against "
+        "the known projects. If a name is ambiguous the tool lists the matches; use "
+        "find_project to look one up. Don't invent an id."
+    ),
+]
+IssueIID = Annotated[
+    int,
+    Field(
+        description="Project-local issue number — the '#123' shown in the GitLab UI and "
+        "URLs (NOT the global issue id). Get it from list_issues/search_issues if unsure."
+    ),
+]
+MRIID = Annotated[
+    int,
+    Field(
+        description="Project-local merge request number — the '!45' shown in the GitLab UI "
+        "and URLs (NOT the global mr id). Get it from list_merge_requests if unsure."
+    ),
+]
+
+
+async def _warm_current_user():
+    """Best-effort prime of the cached GET /user so 'me' resolves without a round-trip.
+
+    Swallows failures (bad token, endpoint unreachable) so startup never depends on it.
+    """
+    try:
+        await gl.get_current_user()
+    except Exception as e:  # noqa: BLE001 - warm-up must never crash startup
+        log(f"current-user warm-up skipped: {e}")
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(_server):
+    """Warm the search cache and the current-user identity in the background (non-blocking)."""
+    warm = asyncio.create_task(cache.ensure_loaded()) if cache.projects else None
+    asyncio.create_task(_warm_current_user())
+    try:
+        yield {}
+    finally:
+        if warm:
+            warm.cancel()
+
+
+mcp = FastMCP("gitlab", host=_host, port=_port, lifespan=_lifespan)
+
+
+def write_tool():
+    """Like `@mcp.tool()`, but only registers the tool when writes are enabled.
+
+    The decorated function is always defined as a normal module attribute (so it can
+    still be imported/tested), but it is only exposed over MCP when
+    `GITLAB_MCP_ENABLE_WRITES` is set — otherwise the read-only deployment never sees it.
+    """
+    def decorator(fn):
+        return mcp.tool()(fn) if _enable_writes else fn
+    return decorator
+
+
+# ── Wikis ────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def list_wiki_pages(
+    project: Project,
+    with_content: Annotated[
+        bool,
+        Field(description="True to include each page's full markdown body; False (default) "
+        "returns only titles/slugs — much smaller, use it to browse first."),
+    ] = False,
+) -> list:
+    """List the wiki pages of one project (their titles and slugs).
+
+    Call this whenever the user asks what documentation/wiki a project has, wants an
+    overview of its wiki, or needs a slug to open a specific page. Returns the live
+    wiki table of contents from GitLab — do not guess page names from memory."""
+    return await gl.list_wiki_pages(project, with_content)
+
+
+@mcp.tool()
+async def get_wiki_page(
+    project: Project,
+    slug: Annotated[
+        str,
+        Field(description="URL slug of the page (e.g. 'onboarding/setup') as returned by "
+        "list_wiki_pages, search_wiki, or list_wiki_index."),
+    ],
+    section: Annotated[
+        str | None,
+        Field(description="Return only the section whose markdown heading matches this "
+        "(case-insensitive, e.g. 'Rollback'); omit for the whole page. Use it to read one "
+        "part of a long page without pulling the rest into context."),
+    ] = None,
+    max_chars: Annotated[
+        int,
+        Field(description="Cap on returned body length (default 8000); longer bodies are "
+        "truncated with a marker so a large page can't overflow context.", ge=1),
+    ] = 8000,
+) -> dict:
+    """Fetch the text of one specific wiki page (or one section of it).
+
+    Call this whenever the user asks what a wiki/doc page says, or to read a page whose
+    slug you got from list_wiki_pages/search_wiki. Returns the live page body — always
+    call it instead of paraphrasing documentation from memory. For summarising across
+    many pages, prefer gather_wiki (bounded extracts) over opening each page here."""
+    page = await gl.get_wiki_page(project, slug)
+    content = page.get("content") or ""
+    if section:
+        secs = split_sections(content, page.get("title") or "")
+        wanted = section.strip().lower()
+        picked = next(
+            (s for s in secs if s["heading"].lower() == wanted
+             or (s["path"] and s["path"][-1].lower() == wanted)),
+            None,
+        )
+        if picked is None:
+            return {
+                "slug": slug,
+                "error": f"no section matching {section!r}",
+                "available_sections": [" > ".join(s["path"]) or s["heading"] for s in secs],
+            }
+        page["section"] = " > ".join(picked["path"]) or picked["heading"]
+        content = picked["body"]
+    page["content"] = clip(content, max_chars)
+    return page
+
+
+@write_tool()
+async def create_wiki_page(
+    project: Project,
+    title: Annotated[str, Field(description="Title of the new page; also seeds its slug.")],
+    content: Annotated[str, Field(description="Full page body in the chosen format.")],
+    format: Annotated[
+        Literal["markdown", "rdoc", "asciidoc"],
+        Field(description="Markup format for the body (default 'markdown')."),
+    ] = "markdown",
+) -> dict:
+    """Create a new wiki page in a project. Use only when the user explicitly asks to add or
+    write a new wiki/doc page (this writes to GitLab)."""
+    return await gl.create_wiki_page(project, title, content, format)
+
+
+@write_tool()
+async def update_wiki_page(
+    project: Project,
+    slug: Annotated[str, Field(description="Slug of the existing page to edit (from list_wiki_pages/search_wiki).")],
+    title: Annotated[str | None, Field(description="New title; omit to leave the title unchanged.")] = None,
+    content: Annotated[str | None, Field(description="New full body; omit to leave the content unchanged.")] = None,
+) -> dict:
+    """Edit an existing wiki page's title and/or body. Use when the user asks to change, fix,
+    or rewrite a wiki page you can identify by slug (this writes to GitLab)."""
+    return await gl.update_wiki_page(project, slug, title, content)
+
+
+# ── User ──────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def get_current_user(
+    refresh: Annotated[bool, Field(description="Re-fetch from GitLab instead of using the cached identity (only needed if the token changed).")] = False,
+) -> dict:
+    """Identify the user this server authenticates as (the meaning of 'me'/'my'/'I').
+
+    Call this whenever a request is scoped to the current user and you need their
+    username or numeric id — e.g. to self-assign an issue/MR, or to name who 'my
+    issues' belongs to. Returns the live GitLab user record (cached after first call)."""
+    return await gl.get_current_user(refresh)
+
+
+def _compact_todo(raw: dict) -> dict:
+    """The subset of a to-do worth showing — what needs attention, where, and why."""
+    target = raw.get("target") or {}
+    project = raw.get("project") or {}
+    body = raw.get("body") or ""
+    return {
+        "id": raw.get("id"),
+        "action": raw.get("action_name"),      # assigned | mentioned | review_requested | ...
+        "target_type": raw.get("target_type"),  # Issue | MergeRequest | ...
+        "reference": target.get("references", {}).get("full") or target.get("iid"),
+        "title": target.get("title"),
+        "project": project.get("path_with_namespace") or project.get("name"),
+        "author": (raw.get("author") or {}).get("name"),
+        "state": raw.get("state"),
+        "body": body if len(body) <= 200 else body[:200] + "…",
+        "web_url": raw.get("target_url"),
+        "updated_at": raw.get("updated_at"),
+    }
+
+
+@mcp.tool()
+async def my_todos(
+    state: Annotated[Literal["pending", "done"], Field(description="'pending' (default, still needs action) or 'done' (already dealt with).")] = "pending",
+) -> list:
+    """The current user's GitLab to-do list — everything awaiting THEIR attention across all projects.
+
+    This is the tool for 'which MRs/issues/threads am I tagged or mentioned in', 'what needs
+    my review', 'what's on my plate'. GitLab adds a to-do when you're @-mentioned, asked to
+    review, or otherwise pulled in, so it answers those person-centric questions in one call —
+    no project needed. It returns the WHOLE list; read the `action` and `target_type` on each
+    item to see why it's there (mention, review request, …) and pick out what the user asked
+    about — don't expect a pre-filtered result. Takes no required arguments — call with {} for
+    the default pending list, or {"state": "done"} to see completed items.
+
+    For 'issues ASSIGNED to me' specifically, prefer list_issues (omit its project so it
+    defaults to assigned_to_me) — an issue you were assigned may not appear here (GitLab
+    doesn't create a to-do for your own actions). Returns compact items (action, target_type,
+    title, project, url); open the full thing with get_issue / get_merge_request using the
+    project and reference shown."""
+    todos = await gl.list_todos(state=state)
+    return [_compact_todo(t) for t in todos]
+
+
+# ── Issues ────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def list_issues(
+    state: Annotated[Literal["opened", "closed", "all"], Field(description="Filter by state (default 'opened').")] = "opened",
+    scope: Annotated[Literal["assigned_to_me", "created_by_me"] | None, Field(description="Global mode only (project omitted): whose issues to return; defaults to those assigned to you. Ignored when a project is given.")] = None,
+    max_results: Annotated[int, Field(description="Global mode only: cap on issues returned (default 100). If more match, a trailing {'truncated': true, ...} marker is appended — narrow the query rather than assuming you saw everything.", ge=1)] = 100,
+    assignee_username: Annotated[str | None, Field(description="Username of the assignee to filter by (no leading '@'). For 'assigned to me', prefer omitting project so scope defaults to assigned_to_me, or pass your own username from get_current_user.")] = None,
+    milestone: Annotated[str | None, Field(description="Milestone title to filter by (exact title, not id).")] = None,
+    labels: Annotated[str | None, Field(description="Comma-separated label names to require (e.g. 'bug,backend').")] = None,
+    search: Annotated[str | None, Field(description="Free-text to match in issue title/description.")] = None,
+    project: Annotated[str | None, Field(description="Project ID or 'namespace/name' to scope to ONE project. OMIT to search across ALL projects the token can see — in that global mode it returns issues assigned to you unless you set scope or assignee_username.")] = None,
+) -> list:
+    """List and filter issues, either within one project or across all projects.
+
+    Call this whenever the user asks what issues exist, what's open or closed, what's
+    assigned to someone, or which issues carry a label/milestone/keyword. For "issues
+    assigned to me", OMIT project (scope defaults to assigned_to_me — no username needed);
+    a self-referring assignee_username like 'me' is also accepted and resolved for you.
+    Returns live issues from GitLab — always call rather than recalling from memory.
+    Example arguments: {"state": "opened", "project": "platform/backend"}"""
+    # Weak models often pass assignee_username="me" instead of omitting it; resolve any
+    # self-reference to the real current username so the filter isn't looking for a user
+    # literally named "me" (which would silently match nobody).
+    if assignee_username and assignee_username.strip().lower() in {"me", "my", "mine", "myself", "self"}:
+        assignee_username = (await gl.get_current_user())["username"]
+    # Cap only the global path; a named project keeps the full (uncapped) listing.
+    cap = None if project else max_results
+    return await gl.list_issues(project, state, labels, milestone, assignee_username, search, scope=scope, max_results=cap)
+
+
+@mcp.tool()
+async def get_issue(project: Project, issue_iid: IssueIID) -> dict:
+    """Fetch the full details of ONE issue by its IID.
+
+    Call this whenever the user asks about a specific issue's status, title, description,
+    labels, assignee, milestone, or dates. Returns the live issue record — never fabricate
+    an issue's fields; fetch them."""
+    return await gl.get_issue(project, issue_iid)
+
+
+@write_tool()
+async def create_issue(
+    project: Project,
+    title: Annotated[str, Field(description="Issue title (required).")],
+    description: Annotated[str | None, Field(description="Issue body in markdown.")] = None,
+    labels: Annotated[str | None, Field(description="Comma-separated label names to apply.")] = None,
+    milestone_id: Annotated[int | None, Field(description="Numeric milestone id to assign (from list_milestones).")] = None,
+    assignee_id: Annotated[int | None, Field(description="Numeric user id to assign (CE supports a single assignee).")] = None,
+) -> dict:
+    """Create a new issue in a project. Use when the user explicitly asks to open/file/create
+    an issue (this writes to GitLab)."""
+    return await gl.create_issue(project, title, description, labels, milestone_id, assignee_id)
+
+
+@write_tool()
+async def update_issue(
+    project: Project,
+    issue_iid: IssueIID,
+    title: Annotated[str | None, Field(description="New title; omit to leave unchanged.")] = None,
+    description: Annotated[str | None, Field(description="New body; omit to leave unchanged.")] = None,
+    state_event: Annotated[Literal["close", "reopen"] | None, Field(description="Lifecycle action; omit to leave state as-is.")] = None,
+    labels: Annotated[str | None, Field(description="Comma-separated labels to REPLACE the current set; omit to leave unchanged.")] = None,
+    milestone_id: Annotated[int | None, Field(description="Numeric milestone id to set; omit to leave unchanged.")] = None,
+    assignee_id: Annotated[int | None, Field(description="Numeric user id to assign; omit to leave unchanged.")] = None,
+) -> dict:
+    """Edit an existing issue, or close/reopen it. Use when the user asks to change an issue's
+    fields or its open/closed state. Omit any field to leave it untouched (this writes to GitLab)."""
+    return await gl.update_issue(project, issue_iid, title, description, state_event, labels, milestone_id, assignee_id)
+
+
+@write_tool()
+async def add_issue_note(
+    project: Project,
+    issue_iid: IssueIID,
+    body: Annotated[str, Field(description="Comment text in markdown.")],
+) -> dict:
+    """Post a comment on an issue. Use when the user asks to comment on, reply to, or note
+    something on an issue (this writes to GitLab)."""
+    return await gl.add_issue_note(project, issue_iid, body)
+
+
+@mcp.tool()
+async def list_issue_notes(
+    project: Project,
+    issue_iid: IssueIID,
+    sort: Annotated[Literal["asc", "desc"] | None, Field(description="Order direction (server default 'desc').")] = None,
+    order_by: Annotated[Literal["created_at", "updated_at"] | None, Field(description="Sort key (server default 'created_at').")] = None,
+) -> list:
+    """Read an issue's comments and system notes, including cross-reference notes like
+    'mentioned in merge request !45'.
+
+    Call this to see the discussion on an issue, or to discover which MRs/issues reference
+    it. Returns live notes from GitLab."""
+    return await gl.list_issue_notes(project, issue_iid, sort, order_by)
+
+
+@mcp.tool()
+async def list_issue_related_merge_requests(project: Project, issue_iid: IssueIID) -> list:
+    """List the merge requests related to an issue (those that reference or close it).
+
+    Call this when the user asks 'which MR fixes/implements this issue?' or wants the code
+    changes tied to an issue. Returns live data from GitLab."""
+    return await gl.list_issue_related_merge_requests(project, issue_iid)
+
+
+@mcp.tool()
+async def list_issue_links(project: Project, issue_iid: IssueIID) -> list:
+    """List other issues linked to this one, each tagged with a link_type of 'relates_to',
+    'blocks', or 'is_blocked_by'.
+
+    Call this when the user asks what blocks an issue, what it blocks, or what it relates to.
+    Returns live links from GitLab."""
+    return await gl.list_issue_links(project, issue_iid)
+
+
+# ── Milestones ────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def list_milestones(
+    project: Project,
+    state: Annotated[Literal["active", "closed"] | None, Field(description="Filter by state; omit for all.")] = None,
+    title: Annotated[str | None, Field(description="Exact milestone title to filter by.")] = None,
+) -> list:
+    """List a project's milestones.
+
+    Call this when the user asks what milestones/sprints/releases a project has, or needs a
+    milestone id for another call. Returns live milestones from GitLab."""
+    return await gl.list_milestones(project, state, title)
+
+
+@mcp.tool()
+async def get_milestone(
+    project: Project,
+    milestone_id: Annotated[int, Field(description="Numeric milestone id (from list_milestones).")],
+) -> dict:
+    """Fetch one milestone's details (title, dates, state, description) by numeric id.
+
+    Call this when the user asks about a specific milestone's due date, progress, or scope.
+    Returns the live record from GitLab."""
+    return await gl.get_milestone(project, milestone_id)
+
+
+@write_tool()
+async def create_milestone(
+    project: Project,
+    title: Annotated[str, Field(description="Milestone title (required).")],
+    description: Annotated[str | None, Field(description="Milestone description in markdown.")] = None,
+    due_date: Annotated[str | None, Field(description="Due date as 'YYYY-MM-DD'.")] = None,
+    start_date: Annotated[str | None, Field(description="Start date as 'YYYY-MM-DD'.")] = None,
+) -> dict:
+    """Create a new milestone in a project. Use when the user explicitly asks to add a
+    milestone/sprint/release (this writes to GitLab)."""
+    return await gl.create_milestone(project, title, description, due_date, start_date)
+
+
+@write_tool()
+async def update_milestone(
+    project: Project,
+    milestone_id: Annotated[int, Field(description="Numeric milestone id to edit (from list_milestones).")],
+    title: Annotated[str | None, Field(description="New title; omit to leave unchanged.")] = None,
+    description: Annotated[str | None, Field(description="New description; omit to leave unchanged.")] = None,
+    due_date: Annotated[str | None, Field(description="New due date 'YYYY-MM-DD'; omit to leave unchanged.")] = None,
+    start_date: Annotated[str | None, Field(description="New start date 'YYYY-MM-DD'; omit to leave unchanged.")] = None,
+    state_event: Annotated[Literal["activate", "close"] | None, Field(description="Lifecycle action; omit to leave as-is.")] = None,
+) -> dict:
+    """Edit a milestone, or activate/close it. Use when the user asks to change a milestone's
+    fields or state. Omit any field to leave it untouched (this writes to GitLab)."""
+    return await gl.update_milestone(project, milestone_id, title, description, due_date, start_date, state_event)
+
+
+# ── Repository ────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def list_repository_tree(
+    project: Project,
+    path: Annotated[str | None, Field(description="Subdirectory to list under; omit for the repo root.")] = None,
+    ref: Annotated[str | None, Field(description="Branch, tag, or commit SHA to read; omit for the default branch.")] = None,
+    recursive: Annotated[bool, Field(description="True to recurse into all subdirectories; False (default) lists one level.")] = False,
+) -> list:
+    """List files and folders in a project's repository.
+
+    Call this when the user asks what files/directories a repo contains, wants to browse its
+    structure, or needs an exact file path before reading it. Returns the live tree from GitLab."""
+    return await gl.list_repository_tree(project, path, ref, recursive)
+
+
+@mcp.tool()
+async def get_file(
+    project: Project,
+    file_path: Annotated[str, Field(description="Repo-relative path to the file (e.g. 'src/app/main.py').")],
+    ref: Annotated[str, Field(description="Branch, tag, or commit SHA to read from; defaults to 'HEAD'.")] = "HEAD",
+) -> dict:
+    """Read a file's contents from a repository (decoded from base64 to text).
+
+    Call this whenever the user asks what a file contains or to inspect specific source. Get
+    the path from list_repository_tree or search_code first if unsure. Returns the live file
+    — never reconstruct file contents from memory."""
+    return await gl.get_file(project, file_path, ref)
+
+
+@mcp.tool()
+async def list_branches(
+    project: Project,
+    search: Annotated[str | None, Field(description="Substring to filter branch names by; omit for all branches.")] = None,
+) -> list:
+    """List a repository's branches (optionally filtered by name).
+
+    Call this when the user asks what branches exist or wants to find a branch by name.
+    Returns live branches from GitLab."""
+    return await gl.list_branches(project, search)
+
+
+@mcp.tool()
+async def get_branch(
+    project: Project,
+    branch: Annotated[str, Field(description="Exact branch name (e.g. 'main' or 'feature/login').")],
+) -> dict:
+    """Fetch one branch's details, including its latest commit and protection status.
+
+    Call this when the user asks about a specific branch's tip commit or state. Returns the
+    live branch record from GitLab."""
+    return await gl.get_branch(project, branch)
+
+
+@mcp.tool()
+async def list_commits(
+    project: Project,
+    ref_name: Annotated[str | None, Field(description="Branch/tag to list history for; omit for the default branch.")] = None,
+    path: Annotated[str | None, Field(description="Limit to commits touching this file or directory path.")] = None,
+    since: Annotated[str | None, Field(description="Only commits after this ISO-8601 timestamp (e.g. '2026-01-01T00:00:00Z').")] = None,
+    until: Annotated[str | None, Field(description="Only commits before this ISO-8601 timestamp.")] = None,
+) -> list:
+    """List a repository's commit history, optionally scoped by branch, file/path, or date range.
+
+    Call this when the user asks about recent commits, who changed what, or the history of a
+    file. Returns live commits from GitLab."""
+    return await gl.list_commits(project, ref_name, path, since, until)
+
+
+@mcp.tool()
+async def get_commit(
+    project: Project,
+    sha: Annotated[str, Field(description="Full or short commit SHA.")],
+) -> dict:
+    """Fetch one commit's metadata (author, message, date, parents, stats) by SHA.
+
+    Call this when the user asks about a specific commit. For the actual line changes use
+    get_commit_diff. Returns the live commit from GitLab."""
+    return await gl.get_commit(project, sha)
+
+
+@mcp.tool()
+async def get_commit_diff(
+    project: Project,
+    sha: Annotated[str, Field(description="Full or short commit SHA whose diff you want.")],
+) -> list:
+    """Get the code changes (diff) introduced by one commit, broken down per file.
+
+    Call this whenever the user asks what a commit changed or wants to see its diff. Returns
+    the live diff from GitLab."""
+    return await gl.get_commit_diff(project, sha)
+
+
+@mcp.tool()
+async def compare_refs(
+    project: Project,
+    from_ref: Annotated[str, Field(description="Base ref (branch/tag/commit) to compare FROM.")],
+    to_ref: Annotated[str, Field(description="Target ref (branch/tag/commit) to compare TO.")],
+    straight: Annotated[bool, Field(description="True for a straight from..to diff; False (default) uses the merge-base (from...to).")] = False,
+) -> dict:
+    """Compare two refs and return the commits and diff between them.
+
+    Call this when the user asks 'what's different between X and Y', how far a branch is
+    ahead/behind, or what a branch adds over another. Returns the live comparison from GitLab."""
+    return await gl.compare_refs(project, from_ref, to_ref, straight)
+
+
+@write_tool()
+async def create_branch(
+    project: Project,
+    branch: Annotated[str, Field(description="Name for the new branch.")],
+    ref: Annotated[str, Field(description="Existing branch name, tag, or commit SHA to branch from.")],
+) -> dict:
+    """Create a new branch from an existing ref. Use when the user explicitly asks to create a
+    branch (this writes to GitLab)."""
+    return await gl.create_branch(project, branch, ref)
+
+
+@write_tool()
+async def create_or_update_file(
+    project: Project,
+    file_path: Annotated[str, Field(description="Repo-relative path to create or overwrite.")],
+    branch: Annotated[str, Field(description="Branch to commit on (must already exist).")],
+    content: Annotated[str, Field(description="Full new file contents as plain text (not base64).")],
+    commit_message: Annotated[str, Field(description="Commit message for the change.")],
+) -> dict:
+    """Create or overwrite a file in a single commit on a branch (created if absent, replaced if
+    present). Use when the user explicitly asks to write/commit file contents (this writes to
+    GitLab)."""
+    return await gl.create_or_update_file(project, file_path, branch, content, commit_message)
+
+
+# ── Merge Requests ────────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def list_merge_requests(
+    project: Project,
+    state: Annotated[Literal["opened", "closed", "merged", "all"], Field(description="Filter by state (default 'opened').")] = "opened",
+    labels: Annotated[str | None, Field(description="Comma-separated label names to require.")] = None,
+    milestone: Annotated[str | None, Field(description="Milestone title to filter by (exact title).")] = None,
+    author_username: Annotated[str | None, Field(description="Username of the MR author to filter by.")] = None,
+    assignee_username: Annotated[str | None, Field(description="Username of the assignee to filter by.")] = None,
+    reviewer_username: Annotated[str | None, Field(description="Username of a reviewer to filter by.")] = None,
+    source_branch: Annotated[str | None, Field(description="Filter to MRs from this source branch.")] = None,
+    target_branch: Annotated[str | None, Field(description="Filter to MRs into this target branch.")] = None,
+    search: Annotated[str | None, Field(description="Free-text to match in MR title/description.")] = None,
+) -> list:
+    """List and filter a project's merge requests.
+
+    Call this whenever the user asks what MRs are open/merged/closed, who authored or reviews
+    them, or which MRs touch a branch/label/milestone. Returns live MRs from GitLab — always
+    call rather than guessing."""
+    return await gl.list_merge_requests(
+        project, state, labels, milestone, author_username,
+        assignee_username, reviewer_username, source_branch, target_branch, search,
+    )
+
+
+@mcp.tool()
+async def get_merge_request(project: Project, mr_iid: MRIID) -> dict:
+    """Fetch the full details of ONE merge request by its IID.
+
+    Call this whenever the user asks about a specific MR's status, title, description,
+    source/target branch, reviewers, or merge state. Returns the live MR record — never
+    fabricate its fields."""
+    return await gl.get_merge_request(project, mr_iid)
+
+
+@write_tool()
+async def create_merge_request(
+    project: Project,
+    source_branch: Annotated[str, Field(description="Branch containing the changes to merge.")],
+    target_branch: Annotated[str, Field(description="Branch to merge INTO (e.g. 'main').")],
+    title: Annotated[str, Field(description="MR title (required).")],
+    description: Annotated[str | None, Field(description="MR body in markdown (use 'Closes #123' to link issues).")] = None,
+    labels: Annotated[str | None, Field(description="Comma-separated label names to apply.")] = None,
+    milestone_id: Annotated[int | None, Field(description="Numeric milestone id to assign.")] = None,
+    assignee_id: Annotated[int | None, Field(description="Numeric user id to assign.")] = None,
+    remove_source_branch: Annotated[bool | None, Field(description="True to delete the source branch on merge.")] = None,
+    squash: Annotated[bool | None, Field(description="True to squash commits on merge.")] = None,
+) -> dict:
+    """Open a new merge request from source_branch into target_branch. Use when the user
+    explicitly asks to create/open an MR (this writes to GitLab)."""
+    return await gl.create_merge_request(
+        project, source_branch, target_branch, title, description,
+        labels, milestone_id, assignee_id, remove_source_branch, squash,
+    )
+
+
+@write_tool()
+async def update_merge_request(
+    project: Project,
+    mr_iid: MRIID,
+    title: Annotated[str | None, Field(description="New title; omit to leave unchanged.")] = None,
+    description: Annotated[str | None, Field(description="New body; omit to leave unchanged.")] = None,
+    state_event: Annotated[Literal["close", "reopen"] | None, Field(description="Lifecycle action; omit to leave as-is.")] = None,
+    labels: Annotated[str | None, Field(description="Comma-separated labels to REPLACE the current set; omit to leave unchanged.")] = None,
+    milestone_id: Annotated[int | None, Field(description="Numeric milestone id to set; omit to leave unchanged.")] = None,
+    assignee_id: Annotated[int | None, Field(description="Numeric user id to assign; omit to leave unchanged.")] = None,
+    target_branch: Annotated[str | None, Field(description="New target branch; omit to leave unchanged.")] = None,
+    remove_source_branch: Annotated[bool | None, Field(description="Toggle deleting the source branch on merge.")] = None,
+    squash: Annotated[bool | None, Field(description="Toggle squashing commits on merge.")] = None,
+) -> dict:
+    """Edit a merge request, or close/reopen it. Use when the user asks to change an MR's fields
+    or state. Omit any field to leave it untouched (this writes to GitLab)."""
+    return await gl.update_merge_request(
+        project, mr_iid, title, description, state_event, labels,
+        milestone_id, assignee_id, target_branch, remove_source_branch, squash,
+    )
+
+
+@write_tool()
+async def add_merge_request_note(
+    project: Project,
+    mr_iid: MRIID,
+    body: Annotated[str, Field(description="Comment text in markdown.")],
+) -> dict:
+    """Post a comment on a merge request. Use when the user asks to comment on, reply to, or
+    leave review feedback on an MR (this writes to GitLab)."""
+    return await gl.add_merge_request_note(project, mr_iid, body)
+
+
+@mcp.tool()
+async def get_merge_request_changes(project: Project, mr_iid: MRIID) -> list:
+    """Get the diff of a merge request, broken down per changed file.
+
+    Call this whenever the user asks what an MR changes, wants to review its code, or asks
+    for its diff. Returns the live diff from GitLab."""
+    return await gl.get_merge_request_changes(project, mr_iid)
+
+
+@mcp.tool()
+async def get_merge_request_commits(project: Project, mr_iid: MRIID) -> list:
+    """List the commits contained in a merge request.
+
+    Call this when the user asks which commits an MR includes or wants its commit history.
+    Returns live commits from GitLab."""
+    return await gl.get_merge_request_commits(project, mr_iid)
+
+
+@mcp.tool()
+async def get_merge_request_closes_issues(project: Project, mr_iid: MRIID) -> list:
+    """List the issues a merge request will auto-close on merge (its 'Closes #123' links).
+
+    Call this when the user asks which issues an MR resolves or closes. Returns live data
+    from GitLab."""
+    return await gl.get_merge_request_closes_issues(project, mr_iid)
+
+
+# ── Labels ────────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def list_labels(
+    project: Project,
+    with_counts: Annotated[bool, Field(description="True to include open/closed issue and MR counts per label.")] = False,
+    search: Annotated[str | None, Field(description="Substring to filter label names by.")] = None,
+) -> list:
+    """List a project's labels.
+
+    Call this when the user asks what labels exist, or you need the exact label name before
+    filtering issues/MRs or creating one. Returns live labels from GitLab."""
+    return await gl.list_labels(project, with_counts, search)
+
+
+@mcp.tool()
+async def get_label(
+    project: Project,
+    label_id: Annotated[str, Field(description="The label's numeric id or its exact name.")],
+) -> dict:
+    """Fetch one label's details (color, description, counts) by id or name.
+
+    Call this when the user asks about a specific label. Returns the live record from GitLab."""
+    return await gl.get_label(project, label_id)
+
+
+@write_tool()
+async def create_label(
+    project: Project,
+    name: Annotated[str, Field(description="Label name (required).")],
+    color: Annotated[str, Field(description="Hex '#RRGGBB' or a CSS color name (e.g. 'red').")],
+    description: Annotated[str | None, Field(description="Optional label description.")] = None,
+    priority: Annotated[int | None, Field(description="Optional integer priority for the label.")] = None,
+) -> dict:
+    """Create a new label in a project. Use when the user explicitly asks to add a label (this
+    writes to GitLab)."""
+    return await gl.create_label(project, name, color, description, priority)
+
+
+# ── Activity ──────────────────────────────────────────────────────────────────
+
+def _compact_event(raw: dict) -> dict:
+    """One activity event trimmed to what/who/when (plus push detail when present)."""
+    out = {
+        "action": raw.get("action_name"),       # pushed to | opened | closed | commented on | ...
+        "target_type": raw.get("target_type"),   # Issue | MergeRequest | WikiPage::Meta | Note | ...
+        "title": raw.get("target_title"),
+        "author": (raw.get("author") or {}).get("name"),
+        "created_at": raw.get("created_at"),
+    }
+    push = raw.get("push_data")
+    if push:
+        out["push"] = {
+            "ref": push.get("ref"),
+            "commit_count": push.get("commit_count"),
+            "commit_title": push.get("commit_title"),
+        }
+    note = raw.get("note")
+    if note:
+        body = note.get("body") or ""
+        out["comment"] = body if len(body) <= 200 else body[:200] + "…"
+    return out
+
+
+@mcp.tool()
+async def project_activity(
+    project: Project,
+    since: Annotated[str | None, Field(description="Only events on/after this date, 'YYYY-MM-DD' (day granularity). Omit for the most recent activity regardless of date.")] = None,
+    limit: Annotated[int, Field(description="Max events to return, newest first (default 30).", ge=1, le=100)] = 30,
+) -> list:
+    """The recent activity feed for ONE project — pushes, issue/MR opens & closes, comments, wiki edits.
+
+    This answers 'what's the latest activity / what's been happening / any recent updates on
+    <project>'. You can name the project in plain language (e.g. 'Integration of AXTRANS') —
+    it's resolved automatically. Returns compact events (action, target_type, title, author,
+    time) newest first; drill into anything with get_issue / get_merge_request / get_commit."""
+    events = await gl.list_project_events(project, after=since, per_page=min(limit, 100))
+    return [_compact_event(e) for e in events[:limit]]
+
+
+# ── Cross-project search ──────────────────────────────────────────────────────
+
+
+async def _searchable_cache() -> SearchCache:
+    """Shared search-tool preamble: config check, first-run load, throttled delta."""
+    if not cache.projects:
+        raise RuntimeError(
+            f"No search projects configured — create {_projects_file!r} with a "
+            "`projects = [...]` list (see wiki_projects.toml) and restart."
+        )
+    await cache.ensure_loaded()
+    cache.schedule_delta()  # async + throttled; this query is served from cache
+    return cache
+
+
+@mcp.tool()
+async def search_wiki(
+    query: Annotated[str, Field(description="Keywords to match in wiki page titles/text (keyword match, not semantic).")],
+    projects: Annotated[list[str] | None, Field(description="Optional subset of project paths/ids to limit the search to; omit to search all configured projects.")] = None,
+    limit: Annotated[int, Field(description="Max candidate pages to return (default 20).", ge=1)] = 20,
+) -> list:
+    """Search wiki/documentation pages across the whole curated project set at once.
+
+    Call this whenever the user asks a 'where is it documented / how do we do X' question and
+    you don't already know the project+slug. Returns candidate pages (project, slug, title,
+    snippet) to judge yourself — not a ranked answer; open promising ones with
+    get_wiki_page(project, slug). If results look thin or the wording may differ (e.g.
+    'onboarding' vs 'getting started'), scan list_wiki_index for likely titles instead."""
+    c = await _searchable_cache()
+    return c.search_wiki(query, projects, limit)
+
+
+@mcp.tool()
+async def gather_wiki(
+    query: Annotated[str, Field(description="Keywords describing the topic to summarise (keyword match, not semantic).")],
+    projects: Annotated[list[str] | None, Field(description="Optional subset of project paths/ids to limit to; omit to gather across all configured projects.")] = None,
+    max_sections: Annotated[int, Field(description="Max sections to return (default 8).", ge=1)] = 8,
+    section_chars: Annotated[int, Field(description="Max characters kept per section (default 800); longer sections are truncated with a marker.", ge=1)] = 800,
+) -> list:
+    """Gather bounded, relevant wiki *extracts* across many pages to summarise or compare.
+
+    Use this instead of opening pages one by one when the user asks you to summarise,
+    compare, or synthesise what the docs say about a topic across projects (e.g. 'how do
+    we do deployments'). Returns the best-matching sections (project, slug, page_title,
+    section breadcrumb, extract) with each extract clipped to section_chars and the whole
+    result capped at max_sections — so you get enough real text to summarise directly,
+    in one call, without pulling full page bodies into context. Open a specific page with
+    get_wiki_page(project, slug) only if an extract isn't enough; use search_wiki instead
+    when you just need to locate one page."""
+    c = await _searchable_cache()
+    return c.gather_wiki(query, projects, max_sections, section_chars)
+
+
+@mcp.tool()
+async def search_issues(
+    query: Annotated[str, Field(description="Keywords to match in issue title/description/labels (keyword match, not semantic).")],
+    projects: Annotated[list[str] | None, Field(description="Optional subset of project paths/ids to limit to; omit to search all configured projects.")] = None,
+    state: Annotated[Literal["opened", "closed"] | None, Field(description="Filter by state; omit for both.")] = None,
+    limit: Annotated[int, Field(description="Max candidate issues to return (default 20).", ge=1)] = 20,
+) -> list:
+    """Search issues across the whole curated project set at once.
+
+    Call this when the user asks 'is there an issue about X' / 'has anyone reported Y' and you
+    don't already know which project. Returns candidate issues (project, iid, title, state,
+    snippet) to judge yourself — fetch full detail with get_issue(project, iid)."""
+    c = await _searchable_cache()
+    return c.search_issues(query, projects, state, limit)
+
+
+@mcp.tool()
+async def search_code(
+    search: Annotated[
+        str | list[str],
+        Field(description="A code token, or a list of tokens OR'd together. Must be literal "
+        "identifiers/strings as they appear in source (e.g. ['AuthService','auth_service']), "
+        "NOT a natural-language question — prose matches nothing."),
+    ],
+    projects: Annotated[list[str] | None, Field(description="Project paths/ids to limit the fan-out to (pass the few you've narrowed to); omit to sweep the whole curated set (slower).")] = None,
+    extension: Annotated[str | None, Field(description="Restrict to a file extension, e.g. 'py' or 'ts' (no dot).")] = None,
+    per_project: Annotated[int, Field(description="Max hits to pull from each project (default 5).", ge=1)] = 5,
+    max_results: Annotated[int, Field(description="Max total hits to return across all projects (default 40).", ge=1)] = 40,
+) -> list:
+    """Find code across projects via GitLab Basic blobs search — a LITERAL `git grep`, NOT
+    natural-language or semantic search.
+
+    Call this when the user asks where a symbol/string/config lives in the code. Translate
+    intent into real identifiers yourself (e.g. ['AuthService', 'auth_service', 'AuthClient']);
+    a prose question like 'where do we call the auth service' will match nothing. Returns
+    candidate hits (project, path, startline, ref, snippet) to judge yourself — not a ranked
+    answer. Read a winner with get_file(project, path, ref). Searches the default branch HEAD
+    only (no history, no other branches); binaries are skipped."""
+    terms = [search] if isinstance(search, str) else list(search)
+    if extension:
+        terms = [f"{t} extension:{extension}" for t in terms]
+    targets = projects if projects is not None else load_wiki_projects(_projects_file)
+    if not targets:
+        raise RuntimeError(
+            f"No projects to search — pass `projects=[...]` or configure {_projects_file!r}."
+        )
+
+    sem = asyncio.Semaphore(12)
+
+    async def one(proj, term):
+        async with sem:
+            try:
+                return await gl.search_blobs(proj, term, per_page=per_project)
+            except Exception as e:  # a dead/forbidden project must not sink the whole search
+                # 403/404 = no access or no such project (expected, quiet); 5xx =
+                # GitLab is actually failing, so surface it at a louder level.
+                loud = isinstance(e, GitLabError) and e.server_error
+                (log.error if loud else log.warning)("search_code skipping %r: %s", proj, e)
+                return []
+
+    batches = await asyncio.gather(*(one(p, t) for p in targets for t in terms))
+
+    seen: set = set()
+    out: list = []
+    for hits in batches:
+        for h in hits:
+            key = (h["project_id"], h["path"], h["startline"])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(
+                {
+                    "project": h["project_id"],
+                    "path": h["path"],
+                    "startline": h["startline"],
+                    "ref": h["ref"],
+                    "snippet": h["data"],
+                }
+            )
+            if len(out) >= max_results:
+                return out
+    return out
+
+
+@mcp.tool()
+async def list_wiki_index(
+    projects: Annotated[list[str] | None, Field(description="Optional subset of project paths/ids; omit for all configured projects.")] = None,
+) -> list:
+    """List every wiki page (project, title, slug) across the configured projects — a compact
+    table of contents over all cached wikis.
+
+    Call this as a fallback when search_wiki comes up thin or the user's terminology may not
+    match page wording, then open pages with get_wiki_page(project, slug)."""
+    c = await _searchable_cache()
+    return c.wiki_index(projects)
+
+
+@mcp.tool()
+async def find_project(
+    *,
+    limit: Annotated[int, Field(description="Max candidate projects to return (default 10).", ge=1)] = 10,
+    query: Annotated[str, Field(description="A project name, partial name, or path fragment (e.g. 'AXTRANS', 'billing', 'platform/backend').")],
+) -> list:
+    """Look up a project by its human name when you don't know its id or 'namespace/name' path.
+
+    Use this to turn what the user says ('the AXTRANS integration', 'the billing service') into a
+    real project before calling project-scoped tools — though most tools already accept a name
+    directly. Returns candidates (name, path, id, description, web_url); pass the `path` or `id`
+    of the right one to other tools. Only searches the configured (curated) project set.
+    Example arguments: {"query": "platform/backend", "limit": 5}"""
+    c = await _searchable_cache()
+    return c.find_project(query, limit)
+
+
+# ── Operator cache admin (CLI, not MCP tools) ─────────────────────────────────
+# The cache keeps itself fresh (background timer + a throttled delta on every
+# search), so status/refresh are operator diagnostics, not something the model
+# needs. They are exposed via `python server.py --cache-status` / `--refresh-cache`
+# rather than as tools, to keep the model's tool menu focused on user questions.
+
+async def search_cache_status() -> dict:
+    """Health of the cross-project search cache: projects loaded/skipped, page/issue counts, sync recency."""
+    return cache.status()
+
+
+async def refresh_search_cache() -> dict:
+    """Force an incremental sync now (wikis via Events API, issues via updated_after) and return the status."""
+    if not cache.projects:
+        raise RuntimeError(f"No search projects configured — create {_projects_file!r} first.")
+    await cache.ensure_loaded()
+    await cache.delta_sync()
+    return cache.status()
+
+
+# ── Entrypoint ────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    """Run the MCP server, or perform a one-shot cache-admin command and exit."""
+    parser = argparse.ArgumentParser(description="GitLab MCP server")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--cache-status", action="store_true",
+        help="Print search-cache health as JSON and exit (does not start the server).",
+    )
+    group.add_argument(
+        "--refresh-cache", action="store_true",
+        help="Force a cache sync, print the resulting health as JSON, and exit.",
+    )
+    args = parser.parse_args()
+
+    if args.cache_status:
+        async def _warm_then_status():
+            if cache.projects:
+                await cache.ensure_loaded()  # restore snapshot + catch up so counts are real
+            return await search_cache_status()
+        print(json.dumps(asyncio.run(_warm_then_status()), indent=2))
+    elif args.refresh_cache:
+        print(json.dumps(asyncio.run(refresh_search_cache()), indent=2))
+    else:
+        mcp.run(transport="sse")
+
+
+if __name__ == "__main__":
+    main()

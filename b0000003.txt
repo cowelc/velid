@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""
+flatten.py — CONNECTED-SIDE tool. Stdlib only (Python 3.8+).
+
+Converts archives/trees into a flat directory of opaque, dedup'd blob files
+plus a text manifest, suitable for transfer through gateways that block
+archives. Rebuild on the airgapped side with rebuild.py.
+
+Supported inputs (repeatable):
+  --wheel FILE.whl        Python wheel (unzipped; rebuilt as .whl inside)
+  --wheel-dir DIR         every *.whl in DIR
+  --github-zip FILE.zip   GitHub source zip (restored as a source tree)
+  --node-modules DIR      an installed node_modules tree (symlinks preserved)
+  --tree DIR              any plain directory tree
+  --file FILE             a single loose file (e.g. package-lock.json)
+
+Output:
+  OUT/b0000001<ext> ...   deduplicated content blobs (8.3-safe names)
+  OUT/manifest<ext>       manifest (tab-separated), plus manifest_copy<ext>
+
+Manifest format v1 (fields tab-separated; %-encoding for tab/newline/%):
+  # key value                          header comments
+  U  unit_id  kind  name               one per input unit
+  D  unit_id  mode_octal  rel_path     directory (preserves empty dirs)
+  F  unit_id  blob  sha256  size  mode_octal  rel_path
+  L  unit_id  link_target  rel_path    symbolic link
+"""
+import argparse
+import hashlib
+import os
+import shutil
+import stat
+import sys
+import tempfile
+import zipfile
+from datetime import datetime, timezone
+
+MANIFEST_VERSION = "1"
+
+
+def enc(s: str) -> str:
+    """Percent-encode %, tab, LF, CR so the string is safe as a TSV field.
+
+    Inverse of rebuild.py's dec(). Order matters: '%' must be encoded first.
+    """
+    return (s.replace("%", "%25").replace("\t", "%09")
+             .replace("\n", "%0A").replace("\r", "%0D"))
+
+
+def sha256_file(path: str) -> str:
+    """Return the hex SHA-256 digest of a file, streamed in 1 MiB chunks."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def check_zip_paths(zf: zipfile.ZipFile) -> None:
+    """Reject zips containing absolute or parent-traversal ('..') member paths.
+
+    Guards extractall() against zip-slip. Raises ValueError on the first
+    unsafe member.
+    """
+    for info in zf.infolist():
+        name = info.filename.replace("\\", "/")
+        if name.startswith("/") or any(p == ".." for p in name.split("/")):
+            raise ValueError(f"unsafe path inside zip: {info.filename!r}")
+
+
+def extract_zip_preserving_modes(zip_path: str, dest: str) -> None:
+    """Extract a zip into dest, restoring Unix permission bits per member.
+
+    zipfile.extractall() discards modes; this re-applies them from each
+    member's external_attr (upper 16 bits hold the Unix mode). Members with
+    no recorded mode (e.g. zips built on Windows) are left at umask defaults.
+    Used for both wheels and GitHub source zips, where exec bits matter.
+    """
+    with zipfile.ZipFile(zip_path) as zf:
+        check_zip_paths(zf)
+        zf.extractall(dest)
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            mode = (info.external_attr >> 16) & 0o777
+            if mode:
+                os.chmod(os.path.join(dest, *info.filename.split("/")), mode)
+
+
+class Flattener:
+    """Accumulates input units into a flat blob directory plus manifest rows.
+
+    Each input (wheel, GitHub zip, node_modules, tree, single file) becomes a
+    'unit'. File contents are stored once per unique SHA-256 as sequentially
+    numbered blobs (b0000001<ext> ...); the manifest maps every original path
+    back to its blob, mode, size, and digest. Call write_manifest() last.
+    """
+
+    def __init__(self, out_dir: str, ext: str):
+        """out_dir: existing empty directory for blobs+manifest.
+        ext: extension appended to every emitted file (e.g. '.txt')."""
+        self.out = out_dir
+        self.ext = ext
+        self.blobs = {}           # sha256 -> blob filename
+        self.units = []           # (uid, kind, name)
+        self.rows = []            # manifest rows (tuples of str)
+        self.nfiles = self.ndirs = self.nlinks = 0
+        self.blob_bytes = 0
+        self.logical_bytes = 0
+
+    def _blob(self, src: str, digest: str, size: int) -> str:
+        """Store src's content under its digest and return the blob filename.
+
+        Deduplicates: if this digest was seen before, no copy is made and the
+        existing blob name is returned (the SHA-256, not the path, is the
+        identity of the content).
+        """
+        self.logical_bytes += size
+        if digest in self.blobs:
+            return self.blobs[digest]
+        name = f"b{len(self.blobs) + 1:07d}{self.ext}"
+        shutil.copyfile(src, os.path.join(self.out, name))
+        self.blobs[digest] = name
+        self.blob_bytes += size
+        return name
+
+    def _new_unit(self, kind: str, name: str) -> str:
+        """Register an input unit and return its id (u0001, u0002, ...).
+
+        kind drives the restore location in rebuild.py: wheel -> re-zipped
+        under wheels/, github_zip -> src/<name>/, node_modules and tree ->
+        <name>/, file -> files/.
+        """
+        uid = f"u{len(self.units) + 1:04d}"
+        self.units.append((uid, kind, name))
+        return uid
+
+    def add_single_file(self, path: str, kind: str = "file") -> None:
+        """Add one loose file (e.g. package-lock.json) as its own unit."""
+        uid = self._new_unit(kind, os.path.basename(path))
+        st = os.lstat(path)
+        digest = sha256_file(path)
+        blob = self._blob(path, digest, st.st_size)
+        self.rows.append(("F", uid, blob, digest, str(st.st_size),
+                          f"{stat.S_IMODE(st.st_mode):o}",
+                          enc(os.path.basename(path))))
+        self.nfiles += 1
+
+    def add_tree(self, root: str, kind: str, name: str) -> None:
+        """Walk a directory tree and record every dir, file, and symlink.
+
+        Deterministic (sorted) walk; does not follow symlinks. Symlinks —
+        including symlinked directories, which are recorded but never
+        descended into — become 'L' rows carrying the raw readlink target.
+        Directories become 'D' rows (this is what preserves empty dirs and
+        dir modes); regular files become 'F' rows and their content is
+        dedup-stored via _blob(). Paths are stored relative to root with
+        '/' separators regardless of host OS.
+        """
+        root = os.path.abspath(root)
+        uid = self._new_unit(kind, name)
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            dirnames.sort()
+            filenames.sort()
+            # symlinked directories: record as links, do not descend
+            for d in list(dirnames):
+                full = os.path.join(dirpath, d)
+                if os.path.islink(full):
+                    dirnames.remove(d)
+                    rel = os.path.relpath(full, root).replace(os.sep, "/")
+                    self.rows.append(("L", uid, enc(os.readlink(full)), enc(rel)))
+                    self.nlinks += 1
+            if dirpath != root:
+                rel = os.path.relpath(dirpath, root).replace(os.sep, "/")
+                mode = stat.S_IMODE(os.lstat(dirpath).st_mode)
+                self.rows.append(("D", uid, f"{mode:o}", enc(rel)))
+                self.ndirs += 1
+            for fn in filenames:
+                full = os.path.join(dirpath, fn)
+                rel = os.path.relpath(full, root).replace(os.sep, "/")
+                if os.path.islink(full):
+                    self.rows.append(("L", uid, enc(os.readlink(full)), enc(rel)))
+                    self.nlinks += 1
+                    continue
+                st = os.lstat(full)
+                digest = sha256_file(full)
+                blob = self._blob(full, digest, st.st_size)
+                self.rows.append(("F", uid, blob, digest, str(st.st_size),
+                                  f"{stat.S_IMODE(st.st_mode):o}", enc(rel)))
+                self.nfiles += 1
+
+    def add_wheel(self, whl_path: str) -> None:
+        """Unpack a .whl (it is a zip) and record its contents as a unit.
+
+        The unit name keeps the exact original wheel filename — pip parses
+        version/ABI/platform tags from it, so rebuild.py must re-zip under
+        the identical name. Re-zipping is valid because pip verifies the
+        internal RECORD file hashes, not the archive bytes.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            extract_zip_preserving_modes(whl_path, tmp)
+            self.add_tree(tmp, "wheel", os.path.basename(whl_path))
+
+    def add_github_zip(self, zip_path: str) -> None:
+        """Extract a GitHub source zip and record it as a source-tree unit.
+
+        The zip's own top-level '<repo>-<ref>/' wrapper directory is kept
+        as-is for fidelity. Restored under src/<zipname-without-.zip>/.
+        """
+        base = os.path.basename(zip_path)
+        name = base[:-4] if base.lower().endswith(".zip") else base
+        with tempfile.TemporaryDirectory() as tmp:
+            extract_zip_preserving_modes(zip_path, tmp)
+            self.add_tree(tmp, "github_zip", name)
+
+    def write_manifest(self) -> str:
+        """Write the manifest twice (manifest + manifest_copy) and return its name.
+
+        Two identical copies are written so a single corrupted/blocked file
+        does not strand the whole transfer. Header comments carry counts that
+        rebuild.py cross-checks. Returns the primary manifest filename.
+        """
+        mext = self.ext if self.ext else ".tsv"
+        lines = [
+            f"# flatten-manifest v{MANIFEST_VERSION}",
+            f"# created {datetime.now(timezone.utc).isoformat()}",
+            f"# units {len(self.units)}",
+            f"# files {self.nfiles}",
+            f"# dirs {self.ndirs}",
+            f"# links {self.nlinks}",
+            f"# blobs {len(self.blobs)}",
+        ]
+        for uid, kind, name in self.units:
+            lines.append("\t".join(("U", uid, kind, enc(name))))
+        for row in self.rows:
+            lines.append("\t".join(row))
+        text = "\n".join(lines) + "\n"
+        for fname in (f"manifest{mext}", f"manifest_copy{mext}"):
+            with open(os.path.join(self.out, fname), "w", encoding="utf-8",
+                      newline="\n") as f:
+                f.write(text)
+        return f"manifest{mext}"
+
+
+def main() -> int:
+    """CLI entry point: parse inputs, flatten each, write manifest, print stats.
+
+    Refuses to write into a non-empty --out directory (prevents mixing blob
+    sets, which would corrupt dedup numbering). Returns process exit code.
+    """
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--out", required=True, help="output directory (created)")
+    ap.add_argument("--ext", default=".txt",
+                    help="extension for blobs+manifest (default .txt; '' for none)")
+    ap.add_argument("--wheel", action="append", default=[], metavar="FILE.whl")
+    ap.add_argument("--wheel-dir", action="append", default=[], metavar="DIR")
+    ap.add_argument("--github-zip", action="append", default=[], metavar="FILE.zip")
+    ap.add_argument("--node-modules", action="append", default=[], metavar="DIR")
+    ap.add_argument("--tree", action="append", default=[], metavar="DIR")
+    ap.add_argument("--file", action="append", default=[], metavar="FILE")
+    args = ap.parse_args()
+
+    wheels = list(args.wheel)
+    for d in args.wheel_dir:
+        found = sorted(fn for fn in os.listdir(d) if fn.endswith(".whl"))
+        if not found:
+            print(f"WARNING: no .whl files in {d}", file=sys.stderr)
+        wheels += [os.path.join(d, fn) for fn in found]
+
+    if not any((wheels, args.github_zip, args.node_modules, args.tree, args.file)):
+        ap.error("no inputs given")
+
+    os.makedirs(args.out, exist_ok=True)
+    if os.listdir(args.out):
+        ap.error(f"--out {args.out} is not empty")
+
+    fl = Flattener(args.out, args.ext)
+    for w in wheels:
+        fl.add_wheel(w)
+    for z in args.github_zip:
+        fl.add_github_zip(z)
+    for nm in args.node_modules:
+        fl.add_tree(nm, "node_modules", os.path.basename(os.path.normpath(nm)))
+    for t in args.tree:
+        fl.add_tree(t, "tree", os.path.basename(os.path.normpath(t)))
+    for f in args.file:
+        fl.add_single_file(f)
+
+    mname = fl.write_manifest()
+    dedup = fl.logical_bytes - fl.blob_bytes
+    print(f"units:        {len(fl.units)}")
+    print(f"files:        {fl.nfiles}  (dirs {fl.ndirs}, symlinks {fl.nlinks})")
+    print(f"unique blobs: {len(fl.blobs)}  ({fl.blob_bytes:,} bytes on disk)")
+    print(f"dedup saved:  {dedup:,} bytes / {fl.nfiles - len(fl.blobs)} files")
+    print(f"manifest:     {mname} (+ manifest_copy)")
+    print("Transfer ALL blobs + BOTH manifest copies + rebuild.py (rename to "
+          "rebuild_py.txt if needed).")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,30 @@
+---
+name: Tool-Call Formatting
+alwaysApply: true
+description: Reduces malformed JSON tool-call arguments on locally-hosted, weaker models (e.g. qwen3.6 via vLLM). Advisory only — does not replace a vLLM-side chat-template fix.
+---
+
+# Tool-Call Formatting
+
+Before emitting any tool call, follow these rules exactly:
+
+- Always close reasoning with `</think>` before starting a tool call. Never reason,
+  explain, or think inside a tool call or its arguments — that is a fatal error.
+- Tool-call arguments must be strict JSON: double-quoted keys and string values only,
+  never single quotes or Python dict syntax.
+- Put a comma after every key-value pair except the last one in the object. Before
+  emitting the closing `}`, re-check that every field you wrote is followed by either
+  a comma or the closing brace — nothing else.
+- Only include fields you have a real value for. Omit optional fields entirely rather
+  than guessing, passing null, or passing an empty string.
+- Use the exact parameter names shown in the tool definition — do not invent, abbreviate,
+  or rename fields.
+- Prefer the fewest arguments that answer the request. A tool call with one or two fields
+  is far less likely to be malformed than one with many.
+- Make one tool call per turn unless the calls are fully independent of each other's
+  results. Do not chain speculative multi-step calls in a single response.
+- If a tool call errors, read the specific error message and correct exactly what it
+  names. Do not retry the identical call, and do not fabricate a result instead of
+  retrying.
+- When a long free-text value (a path, query, or description) is one of several
+  arguments, write it last in the object so nothing has to follow it.

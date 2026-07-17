@@ -1,0 +1,621 @@
+#!/usr/bin/env python3
+"""Unit tests for the MCP tool layer (server.py) — delegation only (Group C).
+
+Each `@mcp.tool()` function is a thin async pass-through to the matching
+`GitLabClient` method. These tests replace the module-global `server.gl` with an
+`AsyncMock` and assert that every tool forwards its arguments 1:1 (in the right
+order) and returns the client's result unchanged. No network or real client is
+involved.
+
+`server.py` validates `GITLAB_URL`/`GITLAB_PAT` at import time, so we set dummy
+values and stub `load_dotenv` before importing it.
+
+Run:
+    .venv/bin/python -m unittest server_test -v
+"""
+import os
+import unittest
+from unittest import mock
+
+# Satisfy server.py's import-time config guard before importing it, and keep a
+# real `.env` from leaking in.
+os.environ.setdefault("GITLAB_URL", "https://gitlab.example.com")
+os.environ.setdefault("GITLAB_PAT", "token")
+with mock.patch("dotenv.load_dotenv"):
+    import server
+
+# A sentinel return value the client is made to hand back, so we can assert the
+# tool passes it through untouched.
+RESULT = object()
+
+# (tool name, positional args) — each tool must call gl.<name>(*args) exactly.
+DELEGATIONS = [
+    # Wikis (get_wiki_page post-processes its result, so it is tested separately)
+    ("list_wiki_pages", ("proj", True)),
+    ("create_wiki_page", ("proj", "Title", "Body", "asciidoc")),
+    ("update_wiki_page", ("proj", "home", "New title", "New body")),
+    # User
+    ("get_current_user", (False,)),
+    # Issues (list_issues is exercised separately — it forwards scope/max_results as kwargs)
+    ("get_issue", ("proj", 7)),
+    ("create_issue", ("proj", "Title", "desc", "bug", 3, 4)),
+    ("update_issue", ("proj", 7, "T", "d", "close", "bug", 3, 4)),
+    ("add_issue_note", ("proj", 7, "a comment")),
+    ("list_issue_notes", ("proj", 7, "asc", "updated_at")),
+    ("list_issue_related_merge_requests", ("proj", 7)),
+    ("list_issue_links", ("proj", 7)),
+    # Milestones
+    ("list_milestones", ("proj", "active", "v1")),
+    ("get_milestone", ("proj", 5)),
+    ("create_milestone", ("proj", "v1", "desc", "2026-01-01", "2025-12-01")),
+    ("update_milestone", ("proj", 5, "T", "d", "2026-01-01", "2025-12-01", "close")),
+    # Repository
+    ("list_repository_tree", ("proj", "src", "main", True)),
+    ("get_file", ("proj", "README.md", "HEAD")),
+    ("list_branches", ("proj", "feature")),
+    ("get_branch", ("proj", "main")),
+    ("list_commits", ("proj", "main", "src", "2026-01-01", "2026-12-31")),
+    ("get_commit", ("proj", "abc123")),
+    ("get_commit_diff", ("proj", "abc123")),
+    ("compare_refs", ("proj", "main", "feature", True)),
+    ("create_branch", ("proj", "feature/x", "main")),
+    ("create_or_update_file", ("proj", "README.md", "main", "content", "commit msg")),
+    # Merge Requests
+    ("list_merge_requests", ("proj", "all", "bug", "v1", "bob", "alice", "carol", "feature", "main", "crash")),
+    ("get_merge_request", ("proj", 9)),
+    ("create_merge_request", ("proj", "feature", "main", "MR", "desc", "bug", 3, 4, True, False)),
+    ("update_merge_request", ("proj", 9, "T", "d", "close", "bug", 3, 4, "develop", False, True)),
+    ("add_merge_request_note", ("proj", 9, "a comment")),
+    ("get_merge_request_changes", ("proj", 9)),
+    ("get_merge_request_commits", ("proj", 9)),
+    ("get_merge_request_closes_issues", ("proj", 9)),
+    # Labels
+    ("list_labels", ("proj", True, "bug")),
+    ("get_label", ("proj", "bug")),
+    ("create_label", ("proj", "bug", "#FF0000", "A defect", 2)),
+]
+
+
+class ToolDelegationTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # Fresh mock client per test; every method is an AsyncMock returning RESULT.
+        self.gl = mock.AsyncMock()
+        self._orig_gl = server.gl
+        server.gl = self.gl
+
+    def tearDown(self):
+        server.gl = self._orig_gl
+
+    async def test_every_tool_forwards_args_and_returns_result(self):
+        """Each tool awaits gl.<same-name>(*args) and returns its value verbatim."""
+        for name, args in DELEGATIONS:
+            with self.subTest(tool=name):
+                tool = getattr(server, name)
+                client_method = getattr(self.gl, name)
+                client_method.reset_mock()
+                client_method.return_value = RESULT
+
+                result = await tool(*args)
+
+                client_method.assert_awaited_once_with(*args)
+                self.assertIs(result, RESULT)
+
+    async def test_list_wiki_pages_defaults_with_content_false(self):
+        """Omitting with_content forwards the False default to the client."""
+        self.gl.list_wiki_pages.return_value = RESULT
+        await server.list_wiki_pages("proj")
+        self.gl.list_wiki_pages.assert_awaited_once_with("proj", False)
+
+    async def test_get_wiki_page_returns_full_body_by_default(self):
+        """No section/short body → forwards project+slug and returns content unchanged."""
+        self.gl.get_wiki_page.return_value = {"slug": "home", "title": "Home", "content": "hello world"}
+        page = await server.get_wiki_page("proj", "home")
+        self.gl.get_wiki_page.assert_awaited_once_with("proj", "home")
+        self.assertEqual(page["content"], "hello world")
+        self.assertNotIn("section", page)
+
+    async def test_get_wiki_page_caps_long_body(self):
+        """A body over max_chars is truncated with a marker."""
+        self.gl.get_wiki_page.return_value = {"slug": "big", "title": "Big", "content": "x" * 500}
+        page = await server.get_wiki_page("proj", "big", max_chars=100)
+        self.assertTrue(page["content"].endswith("omitted]"))
+        self.assertLess(len(page["content"]), 500)
+
+    async def test_get_wiki_page_extracts_one_section(self):
+        """section= returns only the matching section body plus its breadcrumb."""
+        self.gl.get_wiki_page.return_value = {
+            "slug": "run", "title": "Runbook",
+            "content": "# Deploy\nnightly\n## Rollback\nblue-green switch\n## Canary\nten percent",
+        }
+        page = await server.get_wiki_page("proj", "run", section="Rollback")
+        self.assertEqual(page["section"], "Deploy > Rollback")
+        self.assertEqual(page["content"], "blue-green switch")
+
+    async def test_get_wiki_page_unknown_section_lists_available(self):
+        """A miss returns the available section breadcrumbs to retry with."""
+        self.gl.get_wiki_page.return_value = {
+            "slug": "run", "title": "Runbook", "content": "# Deploy\nx\n## Rollback\ny",
+        }
+        page = await server.get_wiki_page("proj", "run", section="Nope")
+        self.assertIn("error", page)
+        self.assertEqual(page["available_sections"], ["Deploy", "Deploy > Rollback"])
+
+    async def test_list_issues_project_path_is_uncapped(self):
+        """A named project forwards its filters and passes max_results=None (no cap)."""
+        self.gl.list_issues.return_value = RESULT
+        result = await server.list_issues(
+            project="proj", state="closed", labels="bug", milestone="v1",
+            assignee_username="alice", search="crash",
+        )
+        self.gl.list_issues.assert_awaited_once_with(
+            "proj", "closed", "bug", "v1", "alice", "crash", scope=None, max_results=None
+        )
+        self.assertIs(result, RESULT)
+
+    async def test_list_issues_defaults_state_opened(self):
+        """Omitting filters forwards state='opened' and None for the rest."""
+        self.gl.list_issues.return_value = RESULT
+        await server.list_issues(project="proj")
+        self.gl.list_issues.assert_awaited_once_with(
+            "proj", "opened", None, None, None, None, scope=None, max_results=None
+        )
+
+    async def test_list_issues_global_path_applies_cap(self):
+        """Omitting project forwards the max_results cap to the global listing."""
+        self.gl.list_issues.return_value = RESULT
+        await server.list_issues(project=None, state="opened", scope="assigned_to_me")
+        self.gl.list_issues.assert_awaited_once_with(
+            None, "opened", None, None, None, None, scope="assigned_to_me", max_results=100
+        )
+
+    async def test_list_issues_global_custom_max_results(self):
+        self.gl.list_issues.return_value = RESULT
+        await server.list_issues(project=None, max_results=25)
+        self.gl.list_issues.assert_awaited_once_with(
+            None, "opened", None, None, None, None, scope=None, max_results=25
+        )
+
+    async def test_list_issues_resolves_self_referring_assignee(self):
+        """assignee_username='me' is resolved to the real current username."""
+        self.gl.get_current_user.return_value = {"username": "root", "id": 1}
+        self.gl.list_issues.return_value = RESULT
+        await server.list_issues(assignee_username="Me")   # case-insensitive
+        self.gl.get_current_user.assert_awaited_once()
+        self.gl.list_issues.assert_awaited_once_with(
+            None, "opened", None, None, "root", None, scope=None, max_results=100
+        )
+
+    async def test_list_issues_literal_assignee_not_resolved(self):
+        """A real username is passed through untouched (no get_current_user call)."""
+        self.gl.list_issues.return_value = RESULT
+        await server.list_issues(assignee_username="alice")
+        self.gl.get_current_user.assert_not_awaited()
+        self.gl.list_issues.assert_awaited_once_with(
+            None, "opened", None, None, "alice", None, scope=None, max_results=100
+        )
+
+    async def test_update_issue_defaults_pass_none(self):
+        """Only project/iid given forwards None for every optional field, in order."""
+        self.gl.update_issue.return_value = RESULT
+        await server.update_issue("proj", 7)
+        self.gl.update_issue.assert_awaited_once_with("proj", 7, None, None, None, None, None, None)
+
+    async def test_list_issue_notes_defaults_pass_none(self):
+        """Omitting sort/order_by forwards None for both."""
+        self.gl.list_issue_notes.return_value = RESULT
+        await server.list_issue_notes("proj", 7)
+        self.gl.list_issue_notes.assert_awaited_once_with("proj", 7, None, None)
+
+    async def test_update_milestone_defaults_pass_none(self):
+        """Only project/id given forwards None for every optional field, in order."""
+        self.gl.update_milestone.return_value = RESULT
+        await server.update_milestone("proj", 5)
+        self.gl.update_milestone.assert_awaited_once_with("proj", 5, None, None, None, None, None)
+
+    async def test_list_repository_tree_defaults(self):
+        """Omitting filters forwards None/False for path/ref/recursive."""
+        self.gl.list_repository_tree.return_value = RESULT
+        await server.list_repository_tree("proj")
+        self.gl.list_repository_tree.assert_awaited_once_with("proj", None, None, False)
+
+    async def test_get_file_defaults_ref_head(self):
+        """Omitting ref forwards 'HEAD' as the default."""
+        self.gl.get_file.return_value = RESULT
+        await server.get_file("proj", "README.md")
+        self.gl.get_file.assert_awaited_once_with("proj", "README.md", "HEAD")
+
+    async def test_list_branches_defaults(self):
+        """Omitting search forwards None."""
+        self.gl.list_branches.return_value = RESULT
+        await server.list_branches("proj")
+        self.gl.list_branches.assert_awaited_once_with("proj", None)
+
+    async def test_list_commits_defaults(self):
+        """Omitting filters forwards None for all optional fields."""
+        self.gl.list_commits.return_value = RESULT
+        await server.list_commits("proj")
+        self.gl.list_commits.assert_awaited_once_with("proj", None, None, None, None)
+
+    async def test_compare_refs_defaults_straight_false(self):
+        """Omitting straight forwards False."""
+        self.gl.compare_refs.return_value = RESULT
+        await server.compare_refs("proj", "main", "feature")
+        self.gl.compare_refs.assert_awaited_once_with("proj", "main", "feature", False)
+
+    async def test_list_merge_requests_defaults_state_opened(self):
+        """Omitting filters forwards state='opened' and None for the rest."""
+        self.gl.list_merge_requests.return_value = RESULT
+        await server.list_merge_requests("proj")
+        self.gl.list_merge_requests.assert_awaited_once_with(
+            "proj", "opened", None, None, None, None, None, None, None, None
+        )
+
+    async def test_create_merge_request_defaults_pass_none(self):
+        """Only required fields given forwards None for every optional field, in order."""
+        self.gl.create_merge_request.return_value = RESULT
+        await server.create_merge_request("proj", "feature", "main", "MR")
+        self.gl.create_merge_request.assert_awaited_once_with(
+            "proj", "feature", "main", "MR", None, None, None, None, None, None
+        )
+
+    async def test_update_merge_request_defaults_pass_none(self):
+        """Only project/iid given forwards None for every optional field, in order."""
+        self.gl.update_merge_request.return_value = RESULT
+        await server.update_merge_request("proj", 9)
+        self.gl.update_merge_request.assert_awaited_once_with(
+            "proj", 9, None, None, None, None, None, None, None, None, None
+        )
+
+    async def test_list_labels_defaults(self):
+        """Omitting filters forwards with_counts=False and search=None."""
+        self.gl.list_labels.return_value = RESULT
+        await server.list_labels("proj")
+        self.gl.list_labels.assert_awaited_once_with("proj", False, None)
+
+    async def test_create_label_defaults_pass_none(self):
+        """Only required fields given forwards None for description and priority."""
+        self.gl.create_label.return_value = RESULT
+        await server.create_label("proj", "bug", "#FF0000")
+        self.gl.create_label.assert_awaited_once_with("proj", "bug", "#FF0000", None, None)
+
+
+class SearchToolsTest(unittest.IsolatedAsyncioTestCase):
+    """The search tools drive the SearchCache, not GitLabClient — test that wiring."""
+
+    def setUp(self):
+        self.cache = mock.MagicMock()
+        self.cache.projects = ["p1"]
+        self.cache.ensure_loaded = mock.AsyncMock()
+        self.cache.delta_sync = mock.AsyncMock()
+        self._orig_cache = server.cache
+        server.cache = self.cache
+
+    def tearDown(self):
+        server.cache = self._orig_cache
+
+    async def test_search_wiki_loads_schedules_and_delegates(self):
+        self.cache.search_wiki.return_value = RESULT
+        result = await server.search_wiki("q", ["p1"], 5)
+        self.cache.ensure_loaded.assert_awaited_once()
+        self.cache.schedule_delta.assert_called_once()
+        self.cache.search_wiki.assert_called_once_with("q", ["p1"], 5)
+        self.assertIs(result, RESULT)
+
+    async def test_gather_wiki_loads_and_delegates(self):
+        self.cache.gather_wiki.return_value = RESULT
+        result = await server.gather_wiki("deployments", ["p1"], 5, 400)
+        self.cache.ensure_loaded.assert_awaited_once()
+        self.cache.schedule_delta.assert_called_once()
+        self.cache.gather_wiki.assert_called_once_with("deployments", ["p1"], 5, 400)
+        self.assertIs(result, RESULT)
+
+    async def test_search_issues_delegates(self):
+        self.cache.search_issues.return_value = RESULT
+        result = await server.search_issues("q", None, "opened", 10)
+        self.cache.search_issues.assert_called_once_with("q", None, "opened", 10)
+        self.assertIs(result, RESULT)
+
+    async def test_list_wiki_index_delegates(self):
+        self.cache.wiki_index.return_value = RESULT
+        self.assertIs(await server.list_wiki_index(), RESULT)
+        self.cache.wiki_index.assert_called_once_with(None)
+
+    async def test_find_project_delegates(self):
+        self.cache.find_project.return_value = RESULT
+        result = await server.find_project(query="axtrans", limit=5)
+        self.cache.ensure_loaded.assert_awaited_once()
+        self.cache.find_project.assert_called_once_with("axtrans", 5)
+        self.assertIs(result, RESULT)
+
+    async def test_find_project_errors_when_unconfigured(self):
+        self.cache.projects = []
+        with self.assertRaises(RuntimeError):
+            await server.find_project(query="axtrans")
+
+    async def test_status_does_not_require_config(self):
+        self.cache.projects = []
+        self.cache.status.return_value = RESULT
+        self.assertIs(await server.search_cache_status(), RESULT)
+
+    async def test_search_tools_error_when_unconfigured(self):
+        self.cache.projects = []
+        for tool in (server.search_wiki, server.search_issues):
+            with self.subTest(tool=tool.__name__), self.assertRaises(RuntimeError):
+                await tool("q")
+        with self.assertRaises(RuntimeError):
+            await server.list_wiki_index()
+        with self.assertRaises(RuntimeError):
+            await server.refresh_search_cache()
+
+    async def test_refresh_awaits_delta_and_returns_status(self):
+        self.cache.status.return_value = RESULT
+        self.assertIs(await server.refresh_search_cache(), RESULT)
+        self.cache.delta_sync.assert_awaited_once()
+
+
+class MyTodosToolTest(unittest.IsolatedAsyncioTestCase):
+    """my_todos forwards filters to GET /todos and compacts the result."""
+
+    def setUp(self):
+        self.gl = mock.AsyncMock()
+        self._orig_gl = server.gl
+        server.gl = self.gl
+
+    def tearDown(self):
+        server.gl = self._orig_gl
+
+    async def test_forwards_state_and_never_filters_by_action(self):
+        # The tool deliberately exposes no action/type filter (weak models over-filter
+        # and miss items); it always fetches the whole pending list.
+        self.gl.list_todos.return_value = []
+        await server.my_todos(state="done")
+        self.gl.list_todos.assert_awaited_once_with(state="done")
+
+    async def test_defaults_state_pending(self):
+        self.gl.list_todos.return_value = []
+        await server.my_todos()
+        self.gl.list_todos.assert_awaited_once_with(state="pending")
+
+    async def test_compacts_todo_shape(self):
+        self.gl.list_todos.return_value = [{
+            "id": 42,
+            "action_name": "assigned",
+            "target_type": "Issue",
+            "target": {"iid": 7, "title": "Fix login", "references": {"full": "grp/app#7"}},
+            "project": {"path_with_namespace": "grp/app", "name": "app"},
+            "author": {"name": "Alice"},
+            "state": "pending",
+            "body": "please look",
+            "target_url": "https://gl/grp/app/-/issues/7",
+            "updated_at": "2026-07-01T00:00:00Z",
+        }]
+        out = await server.my_todos()
+        self.assertEqual(out, [{
+            "id": 42,
+            "action": "assigned",
+            "target_type": "Issue",
+            "reference": "grp/app#7",
+            "title": "Fix login",
+            "project": "grp/app",
+            "author": "Alice",
+            "state": "pending",
+            "body": "please look",
+            "web_url": "https://gl/grp/app/-/issues/7",
+            "updated_at": "2026-07-01T00:00:00Z",
+        }])
+
+    async def test_truncates_long_body(self):
+        self.gl.list_todos.return_value = [{"body": "x" * 500}]
+        out = await server.my_todos()
+        self.assertEqual(len(out[0]["body"]), 201)  # 200 chars + ellipsis
+        self.assertTrue(out[0]["body"].endswith("…"))
+
+
+class ProjectActivityToolTest(unittest.IsolatedAsyncioTestCase):
+    """project_activity pulls one page of events, compacts them, and honors the limit."""
+
+    def setUp(self):
+        self.gl = mock.AsyncMock()
+        self._orig_gl = server.gl
+        server.gl = self.gl
+
+    def tearDown(self):
+        server.gl = self._orig_gl
+
+    async def test_forwards_since_and_page_size(self):
+        self.gl.list_project_events.return_value = []
+        await server.project_activity("grp/app", since="2026-07-01", limit=10)
+        self.gl.list_project_events.assert_awaited_once_with("grp/app", after="2026-07-01", per_page=10)
+
+    async def test_compacts_and_includes_push_and_comment(self):
+        self.gl.list_project_events.return_value = [
+            {
+                "action_name": "pushed to",
+                "target_type": None,
+                "target_title": None,
+                "author": {"name": "Bob"},
+                "created_at": "2026-07-02T09:00:00Z",
+                "push_data": {"ref": "main", "commit_count": 2, "commit_title": "Fix bug"},
+            },
+            {
+                "action_name": "commented on",
+                "target_type": "Issue",
+                "target_title": "Login broken",
+                "author": {"name": "Cara"},
+                "created_at": "2026-07-02T08:00:00Z",
+                "note": {"body": "still failing"},
+            },
+        ]
+        out = await server.project_activity("grp/app")
+        self.assertEqual(out[0]["push"], {"ref": "main", "commit_count": 2, "commit_title": "Fix bug"})
+        self.assertEqual(out[1]["comment"], "still failing")
+        self.assertEqual(out[0]["author"], "Bob")
+        self.assertNotIn("comment", out[0])
+        self.assertNotIn("push", out[1])
+
+    async def test_limit_caps_returned_events(self):
+        self.gl.list_project_events.return_value = [
+            {"action_name": "opened", "created_at": f"t{i}"} for i in range(50)
+        ]
+        out = await server.project_activity("grp/app", limit=5)
+        self.assertEqual(len(out), 5)
+
+
+def _hit(project_id, path, startline, ref="main", data="snippet"):
+    """Build a blobs-search hit as GitLab returns it."""
+    return {
+        "basename": path.rsplit("/", 1)[-1],
+        "data": data,
+        "path": path,
+        "filename": path,
+        "ref": ref,
+        "startline": startline,
+        "project_id": project_id,
+    }
+
+
+class SearchCodeToolTest(unittest.IsolatedAsyncioTestCase):
+    """search_code fans out live blobs searches over projects × terms — no cache."""
+
+    def setUp(self):
+        self.gl = mock.AsyncMock()
+        self._orig_gl = server.gl
+        server.gl = self.gl
+
+    def tearDown(self):
+        server.gl = self._orig_gl
+
+    async def test_fans_out_and_maps_hit_shape(self):
+        self.gl.search_blobs.return_value = [_hit(1, "app/auth.py", 3)]
+        out = await server.search_code("AuthService", projects=["p1"])
+        self.gl.search_blobs.assert_awaited_once_with("p1", "AuthService", per_page=5)
+        self.assertEqual(
+            out,
+            [{"project": 1, "path": "app/auth.py", "startline": 3, "ref": "main", "snippet": "snippet"}],
+        )
+
+    async def test_list_of_terms_ored_across_calls(self):
+        self.gl.search_blobs.return_value = []
+        await server.search_code(["AuthService", "auth_service"], projects=["p1", "p2"])
+        # 2 projects × 2 terms = 4 calls
+        self.assertEqual(self.gl.search_blobs.await_count, 4)
+        searched = {c.args[1] for c in self.gl.search_blobs.await_args_list}
+        self.assertEqual(searched, {"AuthService", "auth_service"})
+
+    async def test_extension_appended_to_each_term(self):
+        self.gl.search_blobs.return_value = []
+        await server.search_code(["Foo", "bar"], projects=["p1"], extension="py")
+        searched = {c.args[1] for c in self.gl.search_blobs.await_args_list}
+        self.assertEqual(searched, {"Foo extension:py", "bar extension:py"})
+
+    async def test_dedups_identical_hits_across_projects(self):
+        self.gl.search_blobs.return_value = [_hit(1, "app/auth.py", 3)]
+        out = await server.search_code("x", projects=["p1", "p2"])
+        self.assertEqual(len(out), 1)
+
+    async def test_caps_at_max_results(self):
+        self.gl.search_blobs.side_effect = lambda p, t, per_page: [
+            _hit(p, f"f{i}.py", i) for i in range(10)
+        ]
+        out = await server.search_code("x", projects=[1, 2, 3], max_results=5)
+        self.assertEqual(len(out), 5)
+
+    async def test_per_project_failure_is_skipped_not_fatal(self):
+        def maybe_fail(project, term, per_page):
+            if project == "bad":
+                raise RuntimeError("403 Forbidden")
+            return [_hit(1, "ok.py", 1)]
+
+        self.gl.search_blobs.side_effect = maybe_fail
+        out = await server.search_code("x", projects=["bad", "good"])
+        self.assertEqual(len(out), 1)
+
+    async def test_no_targets_raises(self):
+        with mock.patch("server.load_wiki_projects", return_value=[]):
+            with self.assertRaises(RuntimeError):
+                await server.search_code("x")
+
+    async def test_omitting_projects_uses_configured_set(self):
+        self.gl.search_blobs.return_value = []
+        with mock.patch("server.load_wiki_projects", return_value=["cfg1"]) as lw:
+            await server.search_code("x")
+        lw.assert_called_once_with(server._projects_file)
+        self.gl.search_blobs.assert_awaited_once_with("cfg1", "x", per_page=5)
+
+
+WRITE_TOOLS = {
+    "create_wiki_page", "update_wiki_page", "create_issue", "update_issue",
+    "add_issue_note", "create_milestone", "update_milestone", "create_branch",
+    "create_or_update_file", "create_merge_request", "update_merge_request",
+    "add_merge_request_note", "create_label",
+}
+CACHE_ADMIN = {"search_cache_status", "refresh_search_cache"}
+
+
+class ToolSurfaceTest(unittest.IsolatedAsyncioTestCase):
+    """The read-only default deployment must not expose write or cache-admin tools."""
+
+    async def test_default_surface_excludes_writes(self):
+        names = {t.name for t in await server.mcp.list_tools()}
+        self.assertEqual(WRITE_TOOLS & names, set(), "writes must be off by default")
+
+    async def test_default_surface_excludes_cache_admin(self):
+        names = {t.name for t in await server.mcp.list_tools()}
+        self.assertEqual(CACHE_ADMIN & names, set())
+
+    async def test_read_tools_still_registered(self):
+        names = {t.name for t in await server.mcp.list_tools()}
+        for expected in ("list_issues", "get_issue", "search_wiki", "gather_wiki", "my_todos",
+                         "project_activity", "find_project"):
+            self.assertIn(expected, names)
+
+    def test_write_tool_functions_remain_callable_when_unregistered(self):
+        # Off the MCP surface, but still importable (e.g. if writes get enabled).
+        for name in WRITE_TOOLS:
+            self.assertTrue(callable(getattr(server, name)))
+
+    def test_cache_admin_functions_remain_callable(self):
+        # Kept as operator helpers behind the CLI, just not as MCP tools.
+        self.assertTrue(callable(server.search_cache_status))
+        self.assertTrue(callable(server.refresh_search_cache))
+
+
+class WriteToolGateTest(unittest.TestCase):
+    """write_tool() registers with mcp only when writes are enabled; else returns the bare fn."""
+
+    def test_registers_when_enabled(self):
+        fn = lambda: None
+        fake_mcp = mock.MagicMock()
+        fake_mcp.tool.return_value = lambda f: f
+        with mock.patch.object(server, "_enable_writes", True), \
+             mock.patch.object(server, "mcp", fake_mcp):
+            result = server.write_tool()(fn)
+        fake_mcp.tool.assert_called_once_with()
+        self.assertIs(result, fn)
+
+    def test_skips_registration_when_disabled(self):
+        fn = lambda: None
+        fake_mcp = mock.MagicMock()
+        with mock.patch.object(server, "_enable_writes", False), \
+             mock.patch.object(server, "mcp", fake_mcp):
+            result = server.write_tool()(fn)
+        fake_mcp.tool.assert_not_called()
+        self.assertIs(result, fn)
+
+
+class EnvBoolTest(unittest.TestCase):
+    def test_truthy_values(self):
+        for v in ("1", "true", "TRUE", "Yes", "on", " on "):
+            with mock.patch.dict("os.environ", {"X": v}):
+                self.assertTrue(server._env_bool("X"))
+
+    def test_falsy_and_default(self):
+        for v in ("0", "false", "no", "off", ""):
+            with mock.patch.dict("os.environ", {"X": v}):
+                self.assertFalse(server._env_bool("X"))
+        self.assertFalse(server._env_bool("MISSING_VAR_XYZ"))
+        self.assertTrue(server._env_bool("MISSING_VAR_XYZ", default=True))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,576 @@
+# GitLab MCP Server
+
+An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that exposes
+a GitLab instance's **wikis, issues, milestones, repositories, merge requests, and labels** as tools your AI assistant can call.
+
+Point Continue, PyCharm Pro, or any MCP-capable client at it, and the assistant can browse code,
+read files, and review commits; create branches and commit changes; open and review merge requests;
+triage and comment on issues; manage milestones; and more — directly against your GitLab project
+without copy-pasting from the web UI.
+
+Built on [FastMCP](https://github.com/modelcontextprotocol/python-sdk), talks to the
+GitLab REST API v4 over `httpx`, and serves tools over **SSE**.
+
+---
+
+## Prerequisites
+
+- **Python 3.11**
+- A **GitLab instance** and a **Personal Access Token (PAT) with the `api` scope**.
+  The `api` scope is required for create/update operations. For read-only use (browse code,
+  list issues/wikis/milestones), any scope granting read access to the project will work.
+  Generate one under _GitLab → Preferences → Access Tokens_.
+- An **MCP-capable client** (e.g. Continue or PyCharm Pro).
+
+---
+
+## Shortest-path tutorial
+
+From a clone of this repository:
+
+```bash
+# 1. Create and activate a virtual environment
+python -m venv .venv
+source .venv/bin/activate
+
+# 2. Install dependencies
+pip install -r requirements.txt
+
+# 3. Create your config from the template
+cp .env.example .env
+# then edit .env and set GITLAB_URL and GITLAB_PAT (see Configuration below)
+
+# 4. Prep the cross-project search list (optional — needed only for the search tools)
+cp wiki_projects.toml.example wiki_projects.toml
+# then edit wiki_projects.toml and list the projects whose wikis/issues to search
+
+# 5. Start the server (serves SSE at http://localhost:8000/sse)
+python server.py
+```
+
+Before wiring up a client, confirm everything works with the read-only smoke test.
+It checks config, tool registration, PAT authentication, and makes live `list_*`
+calls against a real project (nothing is written):
+
+```bash
+# In a second terminal, with the venv active:
+python smoke_test.py <project>
+# <project> is a numeric ID or a 'namespace/name' path, e.g. mygroup/myrepo
+```
+
+A clean exit (status `0`) means you're ready to connect a client.
+
+---
+
+## Configuration
+
+The server reads its configuration from the environment; a local `.env` file is
+loaded automatically. See [.env.example](.env.example) for a template.
+
+| Variable                    | Required | Default              | Description                                                                                                                           |
+| --------------------------- | -------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `GITLAB_URL`                | yes      | —                    | Base URL of your GitLab instance, e.g. `https://gitlab.example.com`                                                                   |
+| `GITLAB_PAT`                | yes      | —                    | Personal Access Token with the `api` scope                                                                                            |
+| `MCP_HOST`                  | no       | `0.0.0.0`            | Interface the SSE server binds to                                                                                                     |
+| `MCP_PORT`                  | no       | `8000`               | Port the SSE server listens on                                                                                                        |
+| `GITLAB_WIKI_PROJECTS_FILE` | no       | `wiki_projects.toml` | TOML file listing the projects covered by the cross-project search tools                                                              |
+| `GITLAB_SEARCH_CACHE_FILE`  | no       | `.search_cache.json` | JSON snapshot of the search cache, restored on restart (set empty to disable)                                                         |
+| `GITLAB_MCP_ENABLE_WRITES`  | no       | `0` (off)            | Expose the mutating tools (create/update/comment). Off by default — the server is **read-only** unless this is `1`/`true`/`yes`/`on`. |
+
+The server refuses to start unless both `GITLAB_URL` and `GITLAB_PAT` are set.
+
+### Read-only by default
+
+Out of the box the server exposes only **read** tools — the ~13 mutating tools
+(`create_*`, `update_*`, `add_*_note`) are not registered at all, so a client
+never sees them. This keeps the tool menu small (which matters for smaller models)
+and makes the onboarding/search deployment safe by construction. Set
+`GITLAB_MCP_ENABLE_WRITES=1` to register the write tools for a deployment that
+needs to author issues, wikis, MRs, etc.
+
+The cross-project search tools read their curated project list from
+`wiki_projects.toml` — a commented TOML file of project paths or IDs
+(`projects = ["group/repo", ...]`). Copy the committed template
+[wiki_projects.toml.example](wiki_projects.toml.example) to `wiki_projects.toml`
+and edit the list (the real file is gitignored, as it is instance-specific). If
+the file is missing, the server still starts; only the search tools are disabled
+until it exists.
+
+---
+
+## Connecting a client
+
+The server exposes a single SSE endpoint: **`http://localhost:8000/sse`**
+(adjust host/port if you changed `MCP_HOST`/`MCP_PORT`). Start the server first,
+then configure your client to connect to that URL.
+
+### Continue
+
+This repo ships a ready-to-use config at
+[.continue/mcpServers/gitlab.yaml](.continue/mcpServers/gitlab.yaml), which Continue
+auto-detects when the workspace is open:
+
+```yaml
+name: gitlab-mcp
+version: 0.0.1
+schema: v1
+mcpServers:
+  - name: GitLab
+    type: sse
+    url: http://localhost:8000/sse
+```
+
+To use it from another workspace, copy this file into that project's `.continue/mcpServers/`
+directory (or your global `~/.continue/` config).
+
+[continue_rules.md](continue_rules.md) is a reference copy of a Continue rules
+file with prompt-level nudges for more reliable tool-call JSON on weaker/local
+models (e.g. close `</think>` before any tool call, double-quoted keys/strings,
+comma-terminated fields, fewer arguments per call). It's a reference copy, not
+active — to load it in Continue, copy it to `.continue/rules/` (project-scoped)
+or `~/.continue/rules/` (global).
+
+### PyCharm Pro
+
+With the JetBrains AI Assistant enabled:
+
+1. Open _Settings → Tools → AI Assistant → Model Context Protocol (MCP)_.
+2. Add a new server.
+3. Choose the **SSE** transport and set the URL to `http://localhost:8000/sse`.
+4. Apply, then confirm the GitLab tools appear in the assistant's tool list.
+
+---
+
+## Available tools
+
+Most tools take a `project` argument — a numeric project ID, a `namespace/name`
+path (e.g. `mygroup/myrepo`), **or a human project name** (e.g. `Integration of
+AXTRANS`). Names are resolved automatically against the configured project set
+(see [Project name resolution](#project-name-resolution)), so users can ask by the
+name they know. A few tools are instance-wide: `get_current_user` and `my_todos`
+take no project, and `list_issues` makes it optional (omit it to search across
+every project). Tool descriptions come from the docstrings in [server.py](server.py).
+
+Tools marked **✎ (write)** are only registered when `GITLAB_MCP_ENABLE_WRITES=1`;
+the default deployment is read-only and never exposes them (see
+[Read-only by default](#read-only-by-default)).
+
+### User
+
+| Tool               | Description                                                                                                                                                   |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `get_current_user` | Identify who the server authenticates as — resolves "me"/"my"; cached.                                                                                        |
+| `my_todos`         | The current user's GitLab to-do list — issues/MRs they're assigned to, @-mentioned in, or asked to review, across all projects. Answers "what's on my plate". |
+
+### Wikis
+
+| Tool                 | Description                                                  |
+| -------------------- | ------------------------------------------------------------ |
+| `list_wiki_pages`    | List all wiki pages for a project (optionally with content). |
+| `get_wiki_page`      | Get one wiki page by slug; optionally just one `section`, and capped at `max_chars` so a large page can't overflow context. |
+| ✎ `create_wiki_page` | Create a new wiki page (`markdown`, `rdoc`, or `asciidoc`).  |
+| ✎ `update_wiki_page` | Update a wiki page's title and/or content.                   |
+
+### Issues
+
+| Tool                                | Description                                                                                                                                      |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `list_issues`                       | List issues in one project, or omit `project` to list across all projects (defaults to issues assigned to you; capped with a truncation marker). |
+| `get_issue`                         | Get a single issue by its project-local IID (the number in the UI).                                                                              |
+| ✎ `create_issue`                    | Create a new issue with title, description, labels, milestone, assignee.                                                                         |
+| ✎ `update_issue`                    | Update an issue, including closing/reopening via `state_event`.                                                                                  |
+| ✎ `add_issue_note`                  | Add a comment to an issue.                                                                                                                       |
+| `list_issue_notes`                  | List an issue's notes, incl. system cross-reference notes ("mentioned in !45").                                                                  |
+| `list_issue_related_merge_requests` | List merge requests that reference or close the issue.                                                                                           |
+| `list_issue_links`                  | List issues linked to this one (`relates_to`/`blocks`/`is_blocked_by`).                                                                          |
+
+### Milestones
+
+| Tool                 | Description                                                       |
+| -------------------- | ----------------------------------------------------------------- |
+| `list_milestones`    | List milestones, filtered by state or exact title.                |
+| `get_milestone`      | Get a single milestone by its numeric ID.                         |
+| ✎ `create_milestone` | Create a milestone with optional description and start/due dates. |
+| ✎ `update_milestone` | Update a milestone, including activate/close via `state_event`.   |
+
+### Repository
+
+| Tool                      | Description                                                              |
+| ------------------------- | ------------------------------------------------------------------------ |
+| `list_repository_tree`    | List files and directories in the repository tree, optionally recursive. |
+| `get_file`                | Get a file's full content and metadata (any ref/branch).                 |
+| `list_branches`           | List all branches in the repository, optionally filtered by name.        |
+| `get_branch`              | Get information about a specific branch (protection status, commit).     |
+| `list_commits`            | List commits, filtered by ref, path, or date range, paginated.           |
+| `get_commit`              | Get detailed information about a specific commit.                        |
+| `get_commit_diff`         | Get the diff for a specific commit, broken down by file.                 |
+| `compare_refs`            | Compare two refs (branches, tags, commits) and return the diff.          |
+| ✎ `create_branch`         | Create a new branch from an existing ref (branch, tag, or commit SHA).   |
+| ✎ `create_or_update_file` | Create or update a file in one commit on a branch (created if absent).   |
+
+### Activity
+
+| Tool               | Description                                                                                                                                                       |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `project_activity` | Recent activity feed for one project — pushes, issue/MR opens & closes, comments, wiki edits. Answers "what's the latest on `<project>`". Accepts a project name. |
+
+### Merge Requests
+
+| Tool                              | Description                                                                                    |
+| --------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `list_merge_requests`             | List MRs, filtered by state, labels, milestone, author, assignee, reviewer, branch, or search. |
+| `get_merge_request`               | Get a single merge request by its project-local IID.                                           |
+| ✎ `create_merge_request`          | Open an MR from a source branch into a target branch.                                          |
+| ✎ `update_merge_request`          | Update an MR, including closing/reopening via `state_event`.                                   |
+| ✎ `add_merge_request_note`        | Add a comment to a merge request.                                                              |
+| `get_merge_request_changes`       | Get the MR's diff, broken down by changed file.                                                |
+| `get_merge_request_commits`       | List the commits included in a merge request.                                                  |
+| `get_merge_request_closes_issues` | List the issues an MR will close on merge (its `Closes #123` links).                           |
+
+### Labels
+
+| Tool             | Description                                                                |
+| ---------------- | -------------------------------------------------------------------------- |
+| `list_labels`    | List a project's labels, optionally with issue/MR counts or a name filter. |
+| `get_label`      | Get a single label by its numeric ID or name.                              |
+| ✎ `create_label` | Create a label (name + color required; optional description and priority). |
+
+### Cross-project search
+
+These tools search **across every project** listed in `wiki_projects.toml`
+(see [wiki_projects.toml.example](wiki_projects.toml.example)) at once (the rest of the tools are
+single-project). They are built for onboarding: "where is X documented?"
+without knowing which team's wiki holds the answer.
+
+| Tool              | Description                                                                                                                |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `search_wiki`     | Keyword-search wiki pages across the configured projects; returns candidate pages with snippets (to *locate* a page).      |
+| `gather_wiki`     | Gather bounded, relevant wiki **section extracts** across projects — to *summarise/compare* a topic in one call (see below). |
+| `search_issues`   | Keyword-search issues (title/description/labels) across the configured projects.                                           |
+| `search_code`     | `git grep` code (blobs) across the configured projects; literal identifier match, live (not cached).                       |
+| `find_project`    | Look up a project by human name/partial name → id, path, description (the explicit form of the automatic name resolution). |
+| `list_wiki_index` | Compact table of contents (project, title, slug) of every cached wiki page.                                                |
+
+The cache keeps itself fresh automatically (a background timer plus a throttled
+sync on every search), so there are no cache-admin _tools_ cluttering the model's
+menu. For operators, the same status/refresh is available from the command line:
+
+```bash
+python server.py --cache-status     # print cache health as JSON and exit
+python server.py --refresh-cache    # force a sync, print health, and exit
+```
+
+### Project name resolution
+
+Every `project` argument accepts a **human project name** in addition to a numeric
+ID or `namespace/name` path. When the server first loads the configured project set
+(the `wiki_projects.toml` list), it caches each project's metadata (id, path, name,
+description). A name is then resolved against that metadata on every call:
+
+- An exact numeric ID or `namespace/name` path is used as-is.
+- A name is matched case-insensitively against each project's name, path, and
+  full name — an **exact** match wins over a substring match, so `Billing`
+  resolves cleanly even when `Billing Legacy` also exists.
+- A unique match is used silently; an **ambiguous** name (several matches) raises
+  an error listing the candidates so the model can ask the user which they meant;
+  an unknown name raises with a hint to use `find_project`.
+
+This means a user can ask "what's the latest activity for the Integration of
+AXTRANS?" and the model can pass that name straight to `project_activity` — no
+need to know the project ID. Resolution only covers the curated project set; for
+other projects, pass an ID or path. Use `find_project` to look one up explicitly.
+
+**How it works** (designed for GitLab CE, which has no Elasticsearch): on first
+use the server pulls every configured project's wiki pages and issues into an
+in-memory cache; afterwards it stays fresh via the project **Events API**
+(wiki create/update/delete all emit events — including edits pushed straight to
+the wiki git repo) plus `updated_after` for issues. Each search triggers a
+throttled background sync, and a timer runs one every 3 hours; queries
+themselves are always answered instantly from the cache.
+
+The cache is snapshotted to `GITLAB_SEARCH_CACHE_FILE` (JSON, atomic write)
+after the initial load and after every sync. On restart the server restores
+from the snapshot instead of re-pulling everything, then a delta replays
+whatever changed while it was down — the per-project watermarks make that
+exact. A corrupt, missing, or format-incompatible snapshot simply falls back
+to a fresh full pull, and projects removed from `wiki_projects.toml` are
+dropped on restore. The file contains wiki/issue content from your GitLab —
+treat it with the same care as the data itself (it is gitignored).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor LLM as MCP Client (LLM)
+    participant Tool as search_wiki / search_issues
+    participant Cache as SearchCache
+    participant BG as delta / timer tasks
+    participant Disk as .search_cache.json
+    participant GL as GitLab API
+
+    Note over Cache,GL: ── First load (ensure_loaded, idempotent) ──
+    Cache->>Disk: restore snapshot
+    alt present & version matches
+        Disk-->>Cache: wikis + issues + meta + watermarks
+        Note right of Cache: only still-configured projects restored
+    else missing / corrupt / stale
+        Disk-->>Cache: restore nothing
+    end
+    loop each NOT-restored project (concurrent, skip-and-log)
+        Cache->>GL: get_project + list_wiki_pages(content) + list_issues + newest event
+        GL-->>Cache: metadata, pages, issues
+        Note right of Cache: set issue_wm = max updated_at,<br/>wiki_wm = newest event created_at
+    end
+    alt any restored
+        Cache->>BG: delta_sync() to replay downtime gap
+    else fresh load
+        Cache->>Disk: save snapshot
+    end
+    Cache->>BG: start timer loop (every 3h)
+
+    Note over LLM,GL: ── Query (served from RAM, never waits) ──
+    LLM->>Tool: search_wiki(query)
+    Tool->>Cache: schedule_delta()  (fire-and-forget)
+    alt not loaded / running / < min-interval
+        Cache-->>Tool: skip (throttled)
+    else slot free
+        Cache->>BG: create_task(delta_sync)
+    end
+    Tool->>Cache: score cached pages/issues (high-recall filter)
+    Cache-->>Tool: candidates (title + snippet + matched_terms)
+    Tool-->>LLM: candidate list (sorted only for the limit cut)
+    LLM->>Tool: get_wiki_page / get_issue (winners)
+
+    Note over BG,GL: ── Delta sweep (schedule_delta OR 3h timer) ──
+    loop each loaded project
+        BG->>GL: list_project_events(after=wiki_wm)  (newest-first, early stop)
+        GL-->>BG: events
+        alt WikiPage::Meta activity
+            BG->>GL: list_wiki_pages(no content)  (reconcile deletes/renames)
+            BG->>GL: get_wiki_page(slug) for changed / new pages
+        end
+        BG->>GL: list_issues(updated_after=issue_wm)
+        GL-->>BG: changed issues
+        Note right of BG: advance wiki_wm & issue_wm
+    end
+    BG->>Disk: save snapshot (atomic tmp+rename)
+```
+
+**Search is a high-recall filter, not a ranker.** Results are _candidates_ —
+title + snippet — for the calling LLM to judge, then follow up with
+`get_wiki_page` / `get_issue` for full content. If wording may differ from the
+query (e.g. "onboarding" vs "Getting Started"), scan `list_wiki_index` instead.
+Known gap: hard-deleted issues linger in the cache until restart (deletes emit
+no `updated_after` signal; issues are normally closed, which _is_ picked up).
+
+**Summarising across wikis stays bounded — `gather_wiki`.** A "summarise how we
+do X across services" question is a trap for a small-context model: answering it
+by opening each candidate with `get_wiki_page` pulls several full page bodies
+into the window at once (and a single large runbook can overflow it alone). So
+each cached wiki body is split into **sections** by its markdown headings, and
+`gather_wiki` returns the best-matching *sections* across all projects — each
+extract clipped to `section_chars` and the whole result capped at `max_sections`
+— so a broad summary reads enough real text in **one** bounded call, without
+loading any full page. `search_wiki` still exists to *locate* a single page;
+`gather_wiki` is for *synthesising* across many. As a backstop, `get_wiki_page`
+itself now caps its body at `max_chars` and can return just one `section`, so
+even opening a page directly can't blow the context. (Retrieval stays
+server-side and the ranking/summarising stays in the calling LLM — the server
+never runs its own model.) The `evals/` harness guards this with a
+`summarise-many-wikis` scenario that fails if the run's accumulated tool-result
+bytes exceed a budget.
+
+**`search_code` is live, not cached.** Code changes far more often than wikis,
+and a repo tree is far larger than a handful of wiki pages, so caching it isn't
+worth it. Instead each call fans out one project-scoped blobs search
+(`git grep` over the default-branch HEAD) per project, concurrently. Because
+it's a literal grep, pass real identifiers — a single token or a list that's
+OR'd together (`["AuthService", "auth_service"]`) — not a prose question; an
+optional `extension` narrows by file type. Narrow the fan-out with `projects=`
+(e.g. the few you found via `search_wiki`) since an unbounded sweep is one API
+call per configured project. Results are candidates (project, path, startline,
+snippet) to judge, then read with `get_file`; a dead or forbidden project is
+skipped, never fatal.
+
+**Design notes** — why it works this way on GitLab CE:
+
+- **Basic search only.** Advanced Search (Elasticsearch) is EE-only, so CE has
+  no cross-project full-text index. The cache exists to provide one locally.
+- **The Events API captures every wiki change** — created, updated, and deleted,
+  whether made via the UI, the API, or a raw `git push` to the wiki repo. That
+  completeness is what lets the wiki delta rely on events alone, with no periodic
+  full re-pull. (Deleting a page yields an event with a null `wiki_page`, so any
+  wiki activity also triggers a cheap per-project slug re-list to reconcile
+  removals and renames.)
+- **No cross-project event feed.** CE exposes events only per project
+  (`/groups/:id/events` is absent and the global `/events` returns just the
+  caller's own activity), so a sync polls each configured project — which is why
+  the search set is a curated list rather than "everything."
+- **The wiki default branch is not assumed.** It varies across GitLab versions
+  (e.g. `main` vs `master`), so refs are read from API responses, never
+  hardcoded.
+
+---
+
+## Development
+
+- **[smoke_test.py](smoke_test.py)** — read-only smoke test (config → tool
+  registration → PAT auth → live `list_*` calls). Exits non-zero on any failure.
+  Run: `python smoke_test.py [project]`.
+- **[client_test.py](client_test.py)** — offline unit tests covering the full
+  `GitLabClient` (fakes `httpx`, no network). Run: `python -m unittest client_test`.
+- **[search_cache_test.py](search_cache_test.py)** — offline unit tests for the
+  search cache (scripted fake client: filter engine, full load, event deltas,
+  throttle, skip-and-log). Run: `python -m unittest search_cache_test`.
+- **[evals/](evals/)** — a fixture-based eval harness that runs the canonical user
+  questions through a real tool-calling model (default: Ollama `qwen2.5:14b-instruct`)
+  with canned tool results, and scores whether the model selected the right tools
+  and grounded its answer. Tests the model + tool-description contract, not the tool
+  bodies. Run: `python -m evals.harness` (needs a model endpoint); its scoring logic
+  is unit-tested offline via `python -m unittest evals.harness_test`. See
+  [evals/README.md](evals/README.md).
+- **[examples.py](examples.py)** — demonstrates the tools across wikis, issues,
+  milestones, repositories, merge requests, and labels two ways: `--direct` (calling
+  `GitLabClient` methods) and `--mcp` (over the live SSE protocol; the server must be
+  running). It **writes real artifacts** — including a branch with a committed file and
+  a merge request — and is guarded by `--yes`; each is recorded to `example_artifacts.json`.
+- **[cleanup.py](cleanup.py)** — deletes exactly the artifacts listed in
+  `example_artifacts.json` (wikis, issues, milestones, branches, merge requests, labels)
+  via raw REST calls. Deleting a branch also drops its commit. Use `--dry-run` to preview first.
+
+### Architecture: two layers
+
+The code is split into two layers with distinct responsibilities:
+
+- **[server.py](server.py) — the MCP layer.** Registers each operation as an
+  `@mcp.tool()`, loads configuration from the environment, and runs the SSE
+  transport. It knows about MCP but nothing about GitLab's URL scheme or auth.
+- **[client.py](client.py) — the GitLab API layer.** `GitLabClient` knows how to
+  talk to GitLab REST v4: building URLs, attaching the `PRIVATE-TOKEN` header,
+  URL-encoding project paths, sending requests, paginating, and raising on
+  non-2xx responses. It knows nothing about MCP.
+- **[search_cache.py](search_cache.py) — the search layer.** `SearchCache` sits
+  on top of `GitLabClient` and backs the cross-project search tools: curated
+  project list, in-memory wiki/issue cache, Events-API delta sync, and the
+  keyword filter engine. It knows nothing about MCP or HTTP.
+
+An MCP client only ever touches the tools in `server.py`; `client.py` is not a
+second entry point but the implementation those tools call into (a near 1:1
+passthrough). Keeping them separate means:
+
+1. **Testability without the MCP stack** — [smoke_test.py](smoke_test.py) and
+   [examples.py](examples.py) can drive GitLab directly through `GitLabClient`
+   (`--direct` mode) without standing up an SSE server, and
+   [cleanup.py](cleanup.py) reuses the same auth/URL logic.
+2. **Separation of concerns** — tool definitions (docstrings, parameters) stay
+   apart from HTTP plumbing (pagination, error handling, encoding).
+3. **Reuse** — shared helpers like pagination live in one place, so every list
+   tool benefits.
+
+---
+
+## Limitations & scope
+
+- **Create and update only — no delete.** Wiki pages, issues, milestones, branches,
+  files, merge requests, and labels cannot be removed through these tools.
+- **Merge requests: create, review, and update only.** No tool _merges_ an MR, and
+  approvals (a premium/EE feature) are not exposed.
+- **Labels: list, get, and create only.** There are no update, delete, or promote tools.
+- **Repository writes are branch-scoped.** You can create branches and create/update
+  files one at a time (each is its own commit). There are no delete, move, or
+  atomic multi-file-commit tools.
+
+---
+
+## Security notes
+
+- A PAT with the `api` scope grants **full read/write access** to everything your
+  GitLab user can reach. Treat it like a password.
+- Keep `.env` out of version control (it is intended to stay local).
+- Prefer a **scoped, short-lived** token where possible.
+- The SSE server is **unauthenticated** and binds to `0.0.0.0` by default. Do not
+  expose the port beyond `localhost` / a trusted network — set `MCP_HOST=127.0.0.1`
+  to restrict it to the local machine.
+
+## Usability Notes
+
+### To review a specific commit:
+
+1. Find the commit SHA — use `list_commits(project, ref_name="main", path="src")` to narrow down by branch/path
+2. Get commit metadata — `get_commit(project, "abc123")` → author, message, timestamp, parents
+3. See what changed — `get_commit_diff(project, "abc123")` → list of file diffs with hunks
+4. Read files at that commit — `get_file(project, "src/app.py", ref="abc123")` → see the file's content at that commit
+
+> Filter by ref_name/path/dates but not by keyword in the message. Would need to list_commits then filter client-side.
+
+---
+
+## Roadmap / future enhancements
+
+### Tool discovery (progressive disclosure) — parked
+
+The server registers every tool flat and always-loaded. That is fine at the
+current count (~30 read tools), and the **read-only-by-default** gate
+([above](#read-only-by-default)) already keeps the menu small by hiding the ~13
+mutating tools unless `GITLAB_MCP_ENABLE_WRITES=1` — a static form of toolset
+gating.
+
+If the catalog grows past **~45 tools**, a flat list starts to cost real
+selection accuracy (the model picking a subtly-wrong neighbour) and prompt
+weight, independent of model strength. At that point, consider a **discovery
+step** — progressive disclosure that decouples the _catalog_ size from the
+_active_ set the model reasons over each turn. Its parts:
+
+1. **A catalog** — every tool with cheap metadata (name, one-line description,
+   category), not its full JSON schema.
+2. **A discovery tool** (always hot) — keyword search **and** multi-select by
+   name, so several schemas load in one round-trip.
+3. **A loading mechanism** — the hard part; three patterns worth evaluating:
+   - **Dispatcher meta-tool** — register `find_tool` + `call_tool`; works on any
+     MCP client, but inner arguments are validated server-side, not by the client.
+   - **Dynamic registration** — enable a toolset, register its tools, fire
+     `notifications/tools/list_changed`; natively callable with full client-side
+     validation, but only if the client honours `list_changed` mid-session.
+   - **Expanded static gating** — extend the `ENABLE_WRITES` idea into named
+     toolset groups chosen up front (what GitHub's MCP server does); simplest,
+     but not adaptive per-task.
+4. **An always-hot core** — high-frequency reads (`search_*`, `get_issue`,
+   `my_todos`) bypass discovery; mutations and admin tools go behind it.
+
+**Why parked:** a discovery step adds a round-trip (a full model turn) before the
+first cold call, which costs more than it saves below ~45 tools. Design for it,
+flip it on when the count crosses that line.
+
+### Semantic search recall (embeddings) — parked
+
+`search_wiki` / `search_issues` retrieve candidates with a keyword filter (a
+high-recall, word-boundary term match over the ~650 cached pages), then the
+calling model ranks them. Keyword filtering is exact and cheap, but it misses
+**synonyms** — a query for "onboarding" won't match a page titled "Getting
+Started". The `list_wiki_index` backstop (the model can scan the compact index
+and drill in) covers this today; embedding-based recall is the heavier option if
+that proves inadequate.
+
+If recall is the bottleneck, add **semantic retrieval** as a complement, not a
+replacement:
+
+1. **Embeddings, not a "vector DB".** At ~650 small pages the store is a
+   `(N, dim)` float32 matrix (~2 MB); cosine similarity is a single numpy matmul.
+   A dedicated vector database (faiss/chromadb/sqlite-vec) is infrastructure this
+   scale does not warrant.
+2. **A local embedder is the real dependency.** For the airgapped / read-only
+   deployment the embedder must be local. The existing Ollama endpoint (already
+   used for local models) serves an embedding model (e.g. `nomic-embed-text`)
+   from the same OpenAI-compatible API — no new infrastructure category.
+3. **Hybrid, never pure vector.** Fuse the keyword candidate set with the top-k
+   semantic neighbours. Pure vector search _loses_ on exact identifiers and error
+   strings where the keyword match is perfect; the union feeds the model's
+   existing ranking step, which already tolerates a noisier candidate set.
+4. **Lifecycle already fits.** Embed on delta upsert, drop the vector on destroy,
+   and persist the matrix in the on-disk snapshot alongside the JSON (bump
+   `CACHE_FORMAT_VERSION`, same pattern as the 1→2 bump).
+
+**Why parked:** the keyword filter plus the `list_wiki_index` backstop may be
+sufficient. Measure recall first with the eval harness (`evals/`) — add
+NL/synonym scenarios and confirm the keyword path actually fails — before taking
+on a local embedding model. Embeddings are future-only, gated on demonstrated
+recall gaps.
