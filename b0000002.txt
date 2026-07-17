@@ -1,30 +1,20 @@
----
-name: Tool-Call Formatting
-alwaysApply: true
-description: Reduces malformed JSON tool-call arguments on locally-hosted, weaker models (e.g. qwen3.6 via vLLM). Advisory only — does not replace a vLLM-side chat-template fix.
----
-
-# Tool-Call Formatting
-
-Before emitting any tool call, follow these rules exactly:
-
-- Always close reasoning with `</think>` before starting a tool call. Never reason,
-  explain, or think inside a tool call or its arguments — that is a fatal error.
-- Tool-call arguments must be strict JSON: double-quoted keys and string values only,
-  never single quotes or Python dict syntax.
-- Put a comma after every key-value pair except the last one in the object. Before
-  emitting the closing `}`, re-check that every field you wrote is followed by either
-  a comma or the closing brace — nothing else.
-- Only include fields you have a real value for. Omit optional fields entirely rather
-  than guessing, passing null, or passing an empty string.
-- Use the exact parameter names shown in the tool definition — do not invent, abbreviate,
-  or rename fields.
-- Prefer the fewest arguments that answer the request. A tool call with one or two fields
-  is far less likely to be malformed than one with many.
-- Make one tool call per turn unless the calls are fully independent of each other's
-  results. Do not chain speculative multi-step calls in a single response.
-- If a tool call errors, read the specific error message and correct exactly what it
-  names. Do not retry the identical call, and do not fabricate a result instead of
-  retrying.
-- When a long free-text value (a path, query, or description) is one of several
-  arguments, write it last in the object so nothing has to follow it.
+GITLAB_URL=https://gitlab.example.com
+GITLAB_PAT=xxxxxxxxxxxxxxxxxxxx
+MCP_HOST=0.0.0.0
+MCP_PORT=8000
+# Curated project list for the cross-project search tools (optional; this is the default)
+GITLAB_WIKI_PROJECTS_FILE=wiki_projects.toml
+# Search cache snapshot restored on restart (optional; this is the default — set empty to disable)
+GITLAB_SEARCH_CACHE_FILE=.search_cache.json
+# Expose the mutating tools (create/update/comment). OFF by default: the server is
+# read-only unless you set this to 1/true/yes/on. Leave unset for onboarding/read use.
+GITLAB_MCP_ENABLE_WRITES=0
+# Log every tool dispatch (name, arguments, outcome, duration) to triage failing
+# calls. OFF by default (1/true/yes/on to enable).
+GITLAB_MCP_LOG_TOOL_CALLS=0
+# Log verbosity when the above is on (optional; default INFO). DEBUG also logs a line
+# at call entry, useful if a call hangs.
+GITLAB_MCP_LOG_LEVEL=INFO
+# Persist the tool-call log to a rotating file as well as stderr (optional; unset =
+# stderr only). Rotates at 5 MB, keeping 3 backups.
+GITLAB_MCP_LOG_FILE=
