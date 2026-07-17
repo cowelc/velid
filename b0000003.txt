@@ -1,303 +1,537 @@
-#!/usr/bin/env python3
-"""
-flatten.py — CONNECTED-SIDE tool. Stdlib only (Python 3.8+).
+Attribute VB_Name = "modDescribeEDM"
+Option Explicit
 
-Converts archives/trees into a flat directory of opaque, dedup'd blob files
-plus a text manifest, suitable for transfer through gateways that block
-archives. Rebuild on the airgapped side with rebuild.py.
+' =====================================================================
+' DescribeEDM - reads the embedded images in a marketing email (EDM)
+' and asks a locally/LAN-hosted vision-language model to describe them,
+' for use when JAWS can't read image-only email content.
+'
+' SETUP
+'   1. In Outlook: Alt+F11 -> File -> Import File -> select this .bas
+'   2. Edit VLM_ENDPOINT and VLM_MODEL below to match your internal
+'      OpenAI-compatible vision server.
+'   3. Add DescribeCurrentEDM to the Quick Access Toolbar:
+'      File > Options > Quick Access Toolbar > Choose commands from:
+'      Macros > select DescribeCurrentEDM > Add.
+'   4. Select or open the EDM email, then click the QAT button.
+'
+' No external references are required (Tools > References is untouched).
+' All COM objects below are standard Windows 10 components accessed via
+' late binding (CreateObject).
+' =====================================================================
 
-Supported inputs (repeatable):
-  --wheel FILE.whl        Python wheel (unzipped; rebuilt as .whl inside)
-  --wheel-dir DIR         every *.whl in DIR
-  --github-zip FILE.zip   GitHub source zip (restored as a source tree)
-  --node-modules DIR      an installed node_modules tree (symlinks preserved)
-  --tree DIR              any plain directory tree
-  --file FILE             a single loose file (e.g. package-lock.json)
+Private Const VLM_ENDPOINT As String = "http://REPLACE-WITH-INTERNAL-HOST:PORT/v1/chat/completions"
+Private Const VLM_MODEL As String = "REPLACE-WITH-MODEL-NAME"
+Private Const VLM_API_KEY As String = "doesnt-matter"
+Private Const IGNORE_SSL_ERRORS As Boolean = True ' equivalent to verify_SSL=false / curl -k; only relevant for https:// endpoints
+Private Const HTTP_TIMEOUT_MS As Long = 45000
+Private Const VLM_PROMPT As String = "This image, or images are sequential fragments of one marketing email, in top-to-bottom, left-to-right reading order. Describe, in a natural paragraph, what the email is promoting, the main offer or call to action, and any important details such as prices or dates."
 
-Output:
-  OUT/b0000001<ext> ...   deduplicated content blobs (8.3-safe names)
-  OUT/manifest<ext>       manifest (tab-separated), plus manifest_copy<ext>
+' Diagnostics: set False to stop writing the debug log (Debug.Print always runs).
+Private Const DEBUG_LOG_ENABLED As Boolean = True
 
-Manifest format v1 (fields tab-separated; %-encoding for tab/newline/%):
-  # key value                          header comments
-  U  unit_id  kind  name               one per input unit
-  D  unit_id  mode_octal  rel_path     directory (preserves empty dirs)
-  F  unit_id  blob  sha256  size  mode_octal  rel_path
-  L  unit_id  link_target  rel_path    symbolic link
-"""
-import argparse
-import hashlib
-import os
-import shutil
-import stat
-import sys
-import tempfile
-import zipfile
-from datetime import datetime, timezone
+' Human-readable name of whatever stage is currently running, so ErrHandler
+' can say *what* failed - VBA has no call stack to infer this from Err alone.
+Private gCurrentStep As String
 
-MANIFEST_VERSION = "1"
+' ---------------------------------------------------------------------
+' Entry point - assign this to a Quick Access Toolbar button.
+'
+' NOTE on debugging: for ErrHandler below to run at all (instead of the VBE
+' breaking into the code), Tools > Options > General > Error Trapping must
+' be set to "Break on Unhandled Errors", not "Break on All Errors".
+' ---------------------------------------------------------------------
+Public Sub DescribeCurrentEDM()
+    Dim mailItem As Outlook.MailItem
+    Dim images() As String
+    Dim mimeTypes() As String
+    Dim summary As String
 
+    On Error GoTo ErrHandler
+    DebugLog "===== DescribeCurrentEDM started ====="
 
-def enc(s: str) -> str:
-    """Percent-encode %, tab, LF, CR so the string is safe as a TSV field.
+RetryLabel:
+    SetStep "Locating mail item"
+    Set mailItem = GetActiveMailItem()
+    If mailItem Is Nothing Then
+        MsgBox "Please open or select an email first.", vbExclamation, "Describe EDM"
+        Exit Sub
+    End If
 
-    Inverse of rebuild.py's dec(). Order matters: '%' must be encoded first.
-    """
-    return (s.replace("%", "%25").replace("\t", "%09")
-             .replace("\n", "%0A").replace("\r", "%0D"))
+    SetStep "Extracting inline images"
+    If Not ExtractInlineImages(mailItem, images, mimeTypes) Then
+        MsgBox "No usable images were found in this email.", vbExclamation, "Describe EDM"
+        Exit Sub
+    End If
+    DebugLog "Extracted " & (UBound(images) - LBound(images) + 1) & " image(s)"
 
+    SetStep "Calling vision-language model"
+    summary = CallVLM(images, mimeTypes)
 
-def sha256_file(path: str) -> str:
-    """Return the hex SHA-256 digest of a file, streamed in 1 MiB chunks."""
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    SetStep "Done"
+    DebugLog "===== DescribeCurrentEDM succeeded ====="
+    MsgBox summary, vbOKOnly + vbInformation, "Email Summary"
+    Exit Sub
 
+ErrHandler:
+    ' Capture Err's fields into locals immediately - they get reset by the
+    ' very next statement that can raise (even On Error Resume Next), and
+    ' the handler itself must never be able to raise again (that's how you
+    ' end up broken into the IDE on some unrelated line with no dialog).
+    Dim errNum As Long, errDesc As String, errSrc As String, failedStep As String
+    errNum = Err.Number
+    errDesc = Err.Description
+    errSrc = Err.Source
+    failedStep = gCurrentStep
+    On Error Resume Next
 
-def check_zip_paths(zf: zipfile.ZipFile) -> None:
-    """Reject zips containing absolute or parent-traversal ('..') member paths.
+    DebugLog "FAILED at step '" & failedStep & "': Error " & errNum & " (" & errSrc & "): " & errDesc
 
-    Guards extractall() against zip-slip. Raises ValueError on the first
-    unsafe member.
-    """
-    for info in zf.infolist():
-        name = info.filename.replace("\\", "/")
-        if name.startswith("/") or any(p == ".." for p in name.split("/")):
-            raise ValueError(f"unsafe path inside zip: {info.filename!r}")
+    Dim msg As String
+    msg = "Could not describe this email." & vbCrLf & vbCrLf & _
+          "Step: " & failedStep & vbCrLf & _
+          "Error " & errNum & " (" & errSrc & "):" & vbCrLf & errDesc
+    If DEBUG_LOG_ENABLED Then
+        msg = msg & vbCrLf & vbCrLf & "Details logged to:" & vbCrLf & LogFilePath()
+    End If
+    msg = msg & vbCrLf & vbCrLf & "Try again?"
 
+    Dim retryResult As VbMsgBoxResult
+    retryResult = MsgBox(msg, vbRetryCancel + vbCritical, "Describe EDM - Error")
+    If retryResult = vbRetry Then
+        ' Restore GoTo-ErrHandler mode before resuming - it was switched to
+        ' Resume Next above so the handler itself can't break, but that mode
+        ' would otherwise silently persist through the retried run too.
+        On Error GoTo ErrHandler
+        Resume RetryLabel
+    End If
+End Sub
 
-def extract_zip_preserving_modes(zip_path: str, dest: str) -> None:
-    """Extract a zip into dest, restoring Unix permission bits per member.
+' ---------------------------------------------------------------------
+' Records the current stage (for ErrHandler) and appends it to the debug
+' log, so a failure with no line-number info can still be traced to a step.
+' ---------------------------------------------------------------------
+Private Sub SetStep(ByVal stepName As String)
+    gCurrentStep = stepName
+    DebugLog "STEP: " & stepName
+End Sub
 
-    zipfile.extractall() discards modes; this re-applies them from each
-    member's external_attr (upper 16 bits hold the Unix mode). Members with
-    no recorded mode (e.g. zips built on Windows) are left at umask defaults.
-    Used for both wheels and GitHub source zips, where exec bits matter.
-    """
-    with zipfile.ZipFile(zip_path) as zf:
-        check_zip_paths(zf)
-        zf.extractall(dest)
-        for info in zf.infolist():
-            if info.is_dir():
-                continue
-            mode = (info.external_attr >> 16) & 0o777
-            if mode:
-                os.chmod(os.path.join(dest, *info.filename.split("/")), mode)
+Private Function LogFilePath() As String
+    LogFilePath = Environ$("TEMP") & "\DescribeEDM_debug.log"
+End Function
 
+' ---------------------------------------------------------------------
+' Appends a timestamped line to the debug log and the Immediate window.
+' Must never itself raise - a logging failure should not mask the real
+' error, so all failures here are swallowed.
+' ---------------------------------------------------------------------
+Private Sub DebugLog(ByVal text As String)
+    Debug.Print text
+    If Not DEBUG_LOG_ENABLED Then Exit Sub
 
-class Flattener:
-    """Accumulates input units into a flat blob directory plus manifest rows.
+    On Error Resume Next
+    Dim f As Integer
+    f = FreeFile
+    Open LogFilePath() For Append As #f
+    Print #f, Format$(Now, "yyyy-mm-dd hh:nn:ss") & "  " & text
+    Close #f
+End Sub
 
-    Each input (wheel, GitHub zip, node_modules, tree, single file) becomes a
-    'unit'. File contents are stored once per unique SHA-256 as sequentially
-    numbered blobs (b0000001<ext> ...); the manifest maps every original path
-    back to its blob, mode, size, and digest. Call write_manifest() last.
-    """
+' ---------------------------------------------------------------------
+' Locate the active/selected mail item, from an open Inspector or from
+' the Explorer selection.
+' ---------------------------------------------------------------------
+Private Function GetActiveMailItem() As Outlook.MailItem
+    Dim obj As Object
 
-    def __init__(self, out_dir: str, ext: str):
-        """out_dir: existing empty directory for blobs+manifest.
-        ext: extension appended to every emitted file (e.g. '.txt')."""
-        self.out = out_dir
-        self.ext = ext
-        self.blobs = {}           # sha256 -> blob filename
-        self.units = []           # (uid, kind, name)
-        self.rows = []            # manifest rows (tuples of str)
-        self.nfiles = self.ndirs = self.nlinks = 0
-        self.blob_bytes = 0
-        self.logical_bytes = 0
+    On Error Resume Next
+    If Not Application.ActiveInspector Is Nothing Then
+        Set obj = Application.ActiveInspector.CurrentItem
+    End If
+    If obj Is Nothing Then
+        If Not Application.ActiveExplorer Is Nothing Then
+            If Application.ActiveExplorer.Selection.Count > 0 Then
+                Set obj = Application.ActiveExplorer.Selection.Item(1)
+            End If
+        End If
+    End If
+    On Error GoTo 0
 
-    def _blob(self, src: str, digest: str, size: int) -> str:
-        """Store src's content under its digest and return the blob filename.
+    If Not obj Is Nothing Then
+        If obj.Class = olMail Then
+            Set GetActiveMailItem = obj
+        End If
+    End If
+End Function
 
-        Deduplicates: if this digest was seen before, no copy is made and the
-        existing blob name is returned (the SHA-256, not the path, is the
-        identity of the content).
-        """
-        self.logical_bytes += size
-        if digest in self.blobs:
-            return self.blobs[digest]
-        name = f"b{len(self.blobs) + 1:07d}{self.ext}"
-        shutil.copyfile(src, os.path.join(self.out, name))
-        self.blobs[digest] = name
-        self.blob_bytes += size
-        return name
+' ---------------------------------------------------------------------
+' Extract every inline (cid:) image referenced in the HTML body, in
+' reading order. Falls back to any image-type attachment if no inline
+' images are found.
+' ---------------------------------------------------------------------
+Private Function ExtractInlineImages(mailItem As Outlook.MailItem, ByRef images() As String, ByRef mimeTypes() As String) As Boolean
+    Dim html As String
+    Dim cids() As String
+    Dim cidCount As Long
+    Dim i As Long, searchPos As Long, cidPos As Long, endPos As Long
+    Dim ch As String
+    Dim cidValue As String
 
-    def _new_unit(self, kind: str, name: str) -> str:
-        """Register an input unit and return its id (u0001, u0002, ...).
+    html = mailItem.HTMLBody
+    ReDim cids(0 To 50)
+    cidCount = 0
+    searchPos = 1
 
-        kind drives the restore location in rebuild.py: wheel -> re-zipped
-        under wheels/, github_zip -> src/<name>/, node_modules and tree ->
-        <name>/, file -> files/.
-        """
-        uid = f"u{len(self.units) + 1:04d}"
-        self.units.append((uid, kind, name))
-        return uid
+    Do
+        cidPos = InStr(searchPos, html, "cid:", vbTextCompare)
+        If cidPos = 0 Then Exit Do
 
-    def add_single_file(self, path: str, kind: str = "file") -> None:
-        """Add one loose file (e.g. package-lock.json) as its own unit."""
-        uid = self._new_unit(kind, os.path.basename(path))
-        st = os.lstat(path)
-        digest = sha256_file(path)
-        blob = self._blob(path, digest, st.st_size)
-        self.rows.append(("F", uid, blob, digest, str(st.st_size),
-                          f"{stat.S_IMODE(st.st_mode):o}",
-                          enc(os.path.basename(path))))
-        self.nfiles += 1
+        cidPos = cidPos + 4
+        endPos = cidPos
+        Do While endPos <= Len(html)
+            ch = Mid(html, endPos, 1)
+            If ch = """" Or ch = "'" Or ch = ">" Or ch = " " Then Exit Do
+            endPos = endPos + 1
+        Loop
 
-    def add_tree(self, root: str, kind: str, name: str) -> None:
-        """Walk a directory tree and record every dir, file, and symlink.
+        cidValue = Mid(html, cidPos, endPos - cidPos)
+        If Len(cidValue) > 0 Then
+            If Not IsInArray(cidValue, cids, cidCount) Then
+                cids(cidCount) = cidValue
+                cidCount = cidCount + 1
+                If cidCount > UBound(cids) Then ReDim Preserve cids(0 To UBound(cids) + 50)
+            End If
+        End If
 
-        Deterministic (sorted) walk; does not follow symlinks. Symlinks —
-        including symlinked directories, which are recorded but never
-        descended into — become 'L' rows carrying the raw readlink target.
-        Directories become 'D' rows (this is what preserves empty dirs and
-        dir modes); regular files become 'F' rows and their content is
-        dedup-stored via _blob(). Paths are stored relative to root with
-        '/' separators regardless of host OS.
-        """
-        root = os.path.abspath(root)
-        uid = self._new_unit(kind, name)
-        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-            dirnames.sort()
-            filenames.sort()
-            # symlinked directories: record as links, do not descend
-            for d in list(dirnames):
-                full = os.path.join(dirpath, d)
-                if os.path.islink(full):
-                    dirnames.remove(d)
-                    rel = os.path.relpath(full, root).replace(os.sep, "/")
-                    self.rows.append(("L", uid, enc(os.readlink(full)), enc(rel)))
-                    self.nlinks += 1
-            if dirpath != root:
-                rel = os.path.relpath(dirpath, root).replace(os.sep, "/")
-                mode = stat.S_IMODE(os.lstat(dirpath).st_mode)
-                self.rows.append(("D", uid, f"{mode:o}", enc(rel)))
-                self.ndirs += 1
-            for fn in filenames:
-                full = os.path.join(dirpath, fn)
-                rel = os.path.relpath(full, root).replace(os.sep, "/")
-                if os.path.islink(full):
-                    self.rows.append(("L", uid, enc(os.readlink(full)), enc(rel)))
-                    self.nlinks += 1
-                    continue
-                st = os.lstat(full)
-                digest = sha256_file(full)
-                blob = self._blob(full, digest, st.st_size)
-                self.rows.append(("F", uid, blob, digest, str(st.st_size),
-                                  f"{stat.S_IMODE(st.st_mode):o}", enc(rel)))
-                self.nfiles += 1
+        searchPos = endPos + 1
+    Loop
 
-    def add_wheel(self, whl_path: str) -> None:
-        """Unpack a .whl (it is a zip) and record its contents as a unit.
+    If cidCount = 0 Then
+        ExtractInlineImages = ExtractAttachmentImages(mailItem, images, mimeTypes)
+        Exit Function
+    End If
 
-        The unit name keeps the exact original wheel filename — pip parses
-        version/ABI/platform tags from it, so rebuild.py must re-zip under
-        the identical name. Re-zipping is valid because pip verifies the
-        internal RECORD file hashes, not the archive bytes.
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            extract_zip_preserving_modes(whl_path, tmp)
-            self.add_tree(tmp, "wheel", os.path.basename(whl_path))
+    Dim tempImages() As String
+    Dim tempMimes() As String
+    ReDim tempImages(0 To cidCount - 1)
+    ReDim tempMimes(0 To cidCount - 1)
 
-    def add_github_zip(self, zip_path: str) -> None:
-        """Extract a GitHub source zip and record it as a source-tree unit.
+    Dim matched As Long
+    matched = 0
+    For i = 0 To cidCount - 1
+        Dim att As Outlook.Attachment
+        Dim b64 As String
+        Dim mime As String
+        Set att = Nothing
+        SetStep "Encoding image " & (i + 1) & " of " & cidCount
+        If FindAttachmentByCid(mailItem, cids(i), att) Then
+            If EncodeAttachmentBase64(att, b64, mime) Then
+                tempImages(matched) = b64
+                tempMimes(matched) = mime
+                matched = matched + 1
+            End If
+        End If
+    Next i
 
-        The zip's own top-level '<repo>-<ref>/' wrapper directory is kept
-        as-is for fidelity. Restored under src/<zipname-without-.zip>/.
-        """
-        base = os.path.basename(zip_path)
-        name = base[:-4] if base.lower().endswith(".zip") else base
-        with tempfile.TemporaryDirectory() as tmp:
-            extract_zip_preserving_modes(zip_path, tmp)
-            self.add_tree(tmp, "github_zip", name)
+    If matched = 0 Then
+        ExtractInlineImages = ExtractAttachmentImages(mailItem, images, mimeTypes)
+        Exit Function
+    End If
 
-    def write_manifest(self) -> str:
-        """Write the manifest twice (manifest + manifest_copy) and return its name.
+    ReDim images(0 To matched - 1)
+    ReDim mimeTypes(0 To matched - 1)
+    For i = 0 To matched - 1
+        images(i) = tempImages(i)
+        mimeTypes(i) = tempMimes(i)
+    Next i
 
-        Two identical copies are written so a single corrupted/blocked file
-        does not strand the whole transfer. Header comments carry counts that
-        rebuild.py cross-checks. Returns the primary manifest filename.
-        """
-        mext = self.ext if self.ext else ".tsv"
-        lines = [
-            f"# flatten-manifest v{MANIFEST_VERSION}",
-            f"# created {datetime.now(timezone.utc).isoformat()}",
-            f"# units {len(self.units)}",
-            f"# files {self.nfiles}",
-            f"# dirs {self.ndirs}",
-            f"# links {self.nlinks}",
-            f"# blobs {len(self.blobs)}",
-        ]
-        for uid, kind, name in self.units:
-            lines.append("\t".join(("U", uid, kind, enc(name))))
-        for row in self.rows:
-            lines.append("\t".join(row))
-        text = "\n".join(lines) + "\n"
-        for fname in (f"manifest{mext}", f"manifest_copy{mext}"):
-            with open(os.path.join(self.out, fname), "w", encoding="utf-8",
-                      newline="\n") as f:
-                f.write(text)
-        return f"manifest{mext}"
+    ExtractInlineImages = True
+End Function
 
+' ---------------------------------------------------------------------
+' Fallback: pick up ordinary (non-inline) image attachments.
+' ---------------------------------------------------------------------
+Private Function ExtractAttachmentImages(mailItem As Outlook.MailItem, ByRef images() As String, ByRef mimeTypes() As String) As Boolean
+    Dim att As Outlook.Attachment
+    Dim count As Long
+    Dim tempImages() As String
+    Dim tempMimes() As String
+    Dim ext As String
+    Dim mime As String
+    Dim b64 As String
+    Dim i As Long
 
-def main() -> int:
-    """CLI entry point: parse inputs, flatten each, write manifest, print stats.
+    If mailItem.Attachments.Count = 0 Then
+        ExtractAttachmentImages = False
+        Exit Function
+    End If
 
-    Refuses to write into a non-empty --out directory (prevents mixing blob
-    sets, which would corrupt dedup numbering). Returns process exit code.
-    """
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--out", required=True, help="output directory (created)")
-    ap.add_argument("--ext", default=".txt",
-                    help="extension for blobs+manifest (default .txt; '' for none)")
-    ap.add_argument("--wheel", action="append", default=[], metavar="FILE.whl")
-    ap.add_argument("--wheel-dir", action="append", default=[], metavar="DIR")
-    ap.add_argument("--github-zip", action="append", default=[], metavar="FILE.zip")
-    ap.add_argument("--node-modules", action="append", default=[], metavar="DIR")
-    ap.add_argument("--tree", action="append", default=[], metavar="DIR")
-    ap.add_argument("--file", action="append", default=[], metavar="FILE")
-    args = ap.parse_args()
+    ReDim tempImages(0 To mailItem.Attachments.Count - 1)
+    ReDim tempMimes(0 To mailItem.Attachments.Count - 1)
+    count = 0
 
-    wheels = list(args.wheel)
-    for d in args.wheel_dir:
-        found = sorted(fn for fn in os.listdir(d) if fn.endswith(".whl"))
-        if not found:
-            print(f"WARNING: no .whl files in {d}", file=sys.stderr)
-        wheels += [os.path.join(d, fn) for fn in found]
+    For Each att In mailItem.Attachments
+        If InStrRev(att.FileName, ".") > 0 Then
+            ext = LCase(Mid(att.FileName, InStrRev(att.FileName, ".") + 1))
+            mime = MimeTypeFromExtension(ext)
+            If mime <> "" Then
+                If EncodeAttachmentBase64(att, b64, mime) Then
+                    tempImages(count) = b64
+                    tempMimes(count) = mime
+                    count = count + 1
+                End If
+            End If
+        End If
+    Next att
 
-    if not any((wheels, args.github_zip, args.node_modules, args.tree, args.file)):
-        ap.error("no inputs given")
+    If count = 0 Then
+        ExtractAttachmentImages = False
+        Exit Function
+    End If
 
-    os.makedirs(args.out, exist_ok=True)
-    if os.listdir(args.out):
-        ap.error(f"--out {args.out} is not empty")
+    ReDim images(0 To count - 1)
+    ReDim mimeTypes(0 To count - 1)
+    For i = 0 To count - 1
+        images(i) = tempImages(i)
+        mimeTypes(i) = tempMimes(i)
+    Next i
 
-    fl = Flattener(args.out, args.ext)
-    for w in wheels:
-        fl.add_wheel(w)
-    for z in args.github_zip:
-        fl.add_github_zip(z)
-    for nm in args.node_modules:
-        fl.add_tree(nm, "node_modules", os.path.basename(os.path.normpath(nm)))
-    for t in args.tree:
-        fl.add_tree(t, "tree", os.path.basename(os.path.normpath(t)))
-    for f in args.file:
-        fl.add_single_file(f)
+    ExtractAttachmentImages = True
+End Function
 
-    mname = fl.write_manifest()
-    dedup = fl.logical_bytes - fl.blob_bytes
-    print(f"units:        {len(fl.units)}")
-    print(f"files:        {fl.nfiles}  (dirs {fl.ndirs}, symlinks {fl.nlinks})")
-    print(f"unique blobs: {len(fl.blobs)}  ({fl.blob_bytes:,} bytes on disk)")
-    print(f"dedup saved:  {dedup:,} bytes / {fl.nfiles - len(fl.blobs)} files")
-    print(f"manifest:     {mname} (+ manifest_copy)")
-    print("Transfer ALL blobs + BOTH manifest copies + rebuild.py (rename to "
-          "rebuild_py.txt if needed).")
-    return 0
+' ---------------------------------------------------------------------
+' Match a cid value to an attachment via PR_ATTACH_CONTENT_ID.
+' ---------------------------------------------------------------------
+Private Function FindAttachmentByCid(mailItem As Outlook.MailItem, cidValue As String, ByRef att As Outlook.Attachment) As Boolean
+    Const PR_ATTACH_CONTENT_ID As String = "http://schemas.microsoft.com/mapi/proptag/0x3712001E"
+    Dim a As Outlook.Attachment
+    Dim thisCid As String
 
+    For Each a In mailItem.Attachments
+        thisCid = ""
+        On Error Resume Next
+        thisCid = a.PropertyAccessor.GetProperty(PR_ATTACH_CONTENT_ID)
+        On Error GoTo 0
+        If StrComp(thisCid, cidValue, vbTextCompare) = 0 Then
+            Set att = a
+            FindAttachmentByCid = True
+            Exit Function
+        End If
+    Next a
 
-if __name__ == "__main__":
-    sys.exit(main())
+    FindAttachmentByCid = False
+End Function
+
+' ---------------------------------------------------------------------
+' Save an attachment to a temp file, base64-encode it, then delete it.
+' ---------------------------------------------------------------------
+Private Function EncodeAttachmentBase64(att As Outlook.Attachment, ByRef b64 As String, ByRef mime As String) As Boolean
+    Dim tempPath As String
+    Dim ext As String
+
+    If InStrRev(att.FileName, ".") = 0 Then
+        EncodeAttachmentBase64 = False
+        Exit Function
+    End If
+
+    ext = LCase(Mid(att.FileName, InStrRev(att.FileName, ".") + 1))
+    mime = MimeTypeFromExtension(ext)
+    If mime = "" Then
+        EncodeAttachmentBase64 = False
+        Exit Function
+    End If
+
+    tempPath = Environ$("TEMP") & "\edm_" & Format(Now, "yyyymmddhhnnss") & "_" & CStr(Int(Rnd * 100000)) & "." & ext
+    att.SaveAsFile tempPath
+
+    b64 = FileToBase64(tempPath)
+
+    On Error Resume Next
+    Kill tempPath
+    On Error GoTo 0
+
+    EncodeAttachmentBase64 = (Len(b64) > 0)
+End Function
+
+Private Function MimeTypeFromExtension(ext As String) As String
+    Select Case LCase(ext)
+        Case "jpg", "jpeg": MimeTypeFromExtension = "image/jpeg"
+        Case "png": MimeTypeFromExtension = "image/png"
+        Case "gif": MimeTypeFromExtension = "image/gif"
+        Case "bmp": MimeTypeFromExtension = "image/bmp"
+        Case Else: MimeTypeFromExtension = ""
+    End Select
+End Function
+
+Private Function IsInArray(value As String, arr() As String, count As Long) As Boolean
+    Dim i As Long
+    For i = 0 To count - 1
+        If StrComp(arr(i), value, vbTextCompare) = 0 Then
+            IsInArray = True
+            Exit Function
+        End If
+    Next i
+    IsInArray = False
+End Function
+
+' ---------------------------------------------------------------------
+' Base64-encode a file's bytes using the MSXML2.DOMDocument
+' bin.base64 node trick (no third-party library needed).
+' ---------------------------------------------------------------------
+Private Function FileToBase64(filePath As String) As String
+    Dim stream As Object
+    Dim bytes() As Byte
+    Dim domDoc As Object
+    Dim node As Object
+
+    Set stream = CreateObject("ADODB.Stream")
+    stream.Type = 1 ' adTypeBinary
+    stream.Open
+    stream.LoadFromFile filePath
+    bytes = stream.Read
+    stream.Close
+
+    Set domDoc = CreateObject("MSXML2.DOMDocument")
+    Set node = domDoc.createElement("b64")
+    node.DataType = "bin.base64"
+    node.nodeTypedValue = bytes
+
+    FileToBase64 = Replace(Replace(node.text, vbCr, ""), vbLf, "")
+End Function
+
+' ---------------------------------------------------------------------
+' Call the internal OpenAI-compatible vision endpoint with all images
+' in one request, and return the model's text response.
+' ---------------------------------------------------------------------
+Private Function CallVLM(images() As String, mimeTypes() As String) As String
+    Dim http As Object
+    Dim requestJson As String
+    Dim responseText As String
+    Dim content As String
+
+    requestJson = BuildRequestJson(images, mimeTypes)
+    DebugLog "Request: endpoint=" & VLM_ENDPOINT & " model=" & VLM_MODEL & _
+             " images=" & (UBound(images) - LBound(images) + 1) & _
+             " bytes=" & Len(requestJson)
+
+    Set http = CreateObject("WinHttp.WinHttpRequest.5.1")
+    http.Open "POST", VLM_ENDPOINT, False
+    If IGNORE_SSL_ERRORS Then
+        ' 13056 = SECURITY_FLAG_IGNORE_UNKNOWN_CA Or IGNORE_CERT_CN_INVALID Or
+        '         IGNORE_CERT_DATE_INVALID Or IGNORE_CERT_WRONG_USAGE
+        http.Option(4) = 13056 ' WinHttpRequestOption_SslErrorIgnoreFlags
+    End If
+    http.SetRequestHeader "Content-Type", "application/json"
+    http.SetRequestHeader "Authorization", "Bearer " & VLM_API_KEY
+    http.SetTimeouts HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS
+    http.Send requestJson
+
+    DebugLog "Response: status=" & http.Status & " " & http.StatusText
+
+    If http.Status <> 200 Then
+        DebugLog "Response body: " & http.ResponseText
+        Err.Raise vbObjectError + 1, "CallVLM", "Server returned status " & http.Status & ": " & _
+                  http.StatusText & vbCrLf & Left$(http.ResponseText, 800)
+    End If
+
+    responseText = http.ResponseText
+    content = ExtractContentField(responseText)
+
+    If Len(content) = 0 Then
+        DebugLog "Response body (unparsed): " & Left$(responseText, 800)
+        Err.Raise vbObjectError + 2, "CallVLM", "Could not parse a response from the server."
+    End If
+
+    DebugLog "Parsed content, length=" & Len(content)
+    CallVLM = content
+End Function
+
+Private Function BuildRequestJson(images() As String, mimeTypes() As String) As String
+    Dim sb As String
+    Dim i As Long
+
+    sb = "{"
+    sb = sb & """model"":""" & JsonEscape(VLM_MODEL) & ""","
+    sb = sb & """messages"":[{"
+    sb = sb & """role"":""user"","
+    sb = sb & """content"":["
+    sb = sb & "{""type"":""text"",""text"":""" & JsonEscape(VLM_PROMPT) & """}"
+
+    For i = LBound(images) To UBound(images)
+        sb = sb & ",{""type"":""image_url"",""image_url"":{""url"":""data:" & mimeTypes(i) & ";base64," & images(i) & """}}"
+    Next i
+
+    sb = sb & "]"
+    sb = sb & "}],"
+    sb = sb & """max_tokens"":600,"
+    sb = sb & """temperature"":0.2"
+    sb = sb & "}"
+
+    BuildRequestJson = sb
+End Function
+
+Private Function JsonEscape(s As String) As String
+    Dim result As String
+    result = s
+    result = Replace(result, "\", "\\")
+    result = Replace(result, """", "\""")
+    result = Replace(result, vbCrLf, "\n")
+    result = Replace(result, vbCr, "\n")
+    result = Replace(result, vbLf, "\n")
+    result = Replace(result, vbTab, "\t")
+    JsonEscape = result
+End Function
+
+' ---------------------------------------------------------------------
+' Purpose-built extractor for the first "content":"..." string in an
+' OpenAI-compatible chat completion response, with JSON unescaping.
+' ---------------------------------------------------------------------
+Private Function ExtractContentField(json As String) As String
+    Dim marker As String
+    Dim startPos As Long, i As Long
+    Dim ch As String
+    Dim result As String
+    Dim inEscape As Boolean
+
+    marker = """content"":"""
+    startPos = InStr(1, json, marker, vbTextCompare)
+    If startPos = 0 Then Exit Function
+
+    startPos = startPos + Len(marker)
+    result = ""
+    i = startPos
+    inEscape = False
+
+    Do While i <= Len(json)
+        ch = Mid(json, i, 1)
+        If inEscape Then
+            Select Case ch
+                Case "n": result = result & vbLf
+                Case "t": result = result & vbTab
+                Case "r": result = result & vbCr
+                Case """": result = result & """"
+                Case "\": result = result & "\"
+                Case "/": result = result & "/"
+                Case "u"
+                    Dim hexCode As String
+                    hexCode = Mid(json, i + 1, 4)
+                    result = result & ChrW(CLng("&H" & hexCode))
+                    i = i + 4
+                Case Else
+                    result = result & ch
+            End Select
+            inEscape = False
+        Else
+            If ch = "\" Then
+                inEscape = True
+            ElseIf ch = """" Then
+                Exit Do
+            Else
+                result = result & ch
+            End If
+        End If
+        i = i + 1
+    Loop
+
+    ExtractContentField = result
+End Function
